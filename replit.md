@@ -1,45 +1,54 @@
-# [Project name]
+# WCT Reader Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A Discord bot that joins voice channels and reads web novel chapters aloud using Microsoft Neural TTS (Jenny voice). Share a chapter link in any channel and the bot scrapes the text, joins your voice channel, and reads it like Eleven Reader — but for Discord.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/api-server run bot` — run the Discord bot (workflow: "Discord Bot")
 - `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+
+## Bot Commands
+
+| Command | Description |
+|---|---|
+| `!read <url>` | Scrape a chapter URL and read it in your voice channel |
+| `!stop` | Stop reading and leave voice |
+| `!pause` | Pause playback |
+| `!resume` | Resume playback |
+| `!skip` | Skip current paragraph |
+| `!progress` | Show reading progress bar |
+| `!help` | Show command list |
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Discord: discord.js v14 + @discordjs/voice
+- TTS: Microsoft Edge Neural TTS (`msedge-tts`, no API key required)
+- Scraping: axios + cheerio
+- Audio: opusscript (pure JS Opus encoder) + system ffmpeg
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/api-server/src/bot/index.ts` — bot entry point, command handlers
+- `artifacts/api-server/src/bot/scraper.ts` — URL scraper (WCT + generic sites)
+- `artifacts/api-server/src/bot/tts.ts` — Microsoft Neural TTS wrapper
+- `artifacts/api-server/src/bot/voice.ts` — voice channel session management
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- TTS runs sentence-by-sentence via streaming so long chapters don't need to buffer fully before playback starts.
+- Each guild gets one active `ReadSession`; starting a new `!read` replaces the existing one.
+- opusscript used instead of native @discordjs/opus to avoid native build requirements on Replit.
+- Scraper tries site-specific selectors first (WCT), falls back to generic article/entry-content selectors.
 
-## Product
+## Discord Bot Setup
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Requires in Discord Developer Portal (discord.com/developers/applications):
+- **Privileged Gateway Intents**: Message Content Intent ✅
+- **Bot Permissions**: Send Messages, Read Message History, Connect, Speak, View Channels
+
+Required secret: `DISCORD_BOT_TOKEN`
 
 ## User preferences
 
 _Populate as you build — explicit user instructions worth remembering across sessions._
-
-## Gotchas
-
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
