@@ -16,7 +16,7 @@ import {
   TextBasedChannel,
   Guild,
 } from "discord.js";
-import { textToMp3File, cleanupFile, splitIntoChunks } from "./tts.js";
+import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 
@@ -43,6 +43,8 @@ export function getGuildVoice(guildId: string): VoiceOption {
 export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   guildVoices.set(guildId, voice);
   console.log(`[voice] guild ${guildId} → ${voice.id}`);
+  // Pre-warm the WebSocket for this voice so the pipeline doesn't cold-start it
+  warmUpVoice(voice);
 }
 
 export function getSession(guildId: string): ReadSession | undefined {

@@ -21,9 +21,40 @@ function sanitizeText(text: string): string {
 }
 
 /**
- * Convert text to an MP3 temp file using a brand-new MsEdgeTTS instance.
- * We NEVER reuse engines — a stale WebSocket is the #1 cause of empty/truncated audio.
- * Retries up to 3 times with exponential back-off.
+ * Low-level: stream text through a single fresh MsEdgeTTS instance → MP3 file.
+ * Throws on failure. Caller cleans up the file.
+ */
+async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
+  const engine = new MsEdgeTTS();
+  await engine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+
+  await Promise.race([
+    new Promise<void>((resolve, reject) => {
+      const { audioStream } = engine.toStream(text);
+      const chunks: Buffer[] = [];
+      audioStream.on("data", (c: Buffer) => chunks.push(c));
+      audioStream.on("end", async () => {
+        try {
+          const buf = Buffer.concat(chunks);
+          if (buf.length === 0) { reject(new Error("Empty audio buffer")); return; }
+          await writeFile(filePath, buf);
+          resolve();
+        } catch (e) { reject(e); }
+      });
+      audioStream.on("error", reject);
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`TTS timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
+    ),
+  ]);
+}
+
+/**
+ * Convert text to an MP3 temp file.
+ * Strategy:
+ *   1. Try requested voice up to 2 times.
+ *   2. If both fail and voice ≠ default, try default voice up to 2 times.
+ *   3. Only throw if everything fails.
  * Caller must delete the file via cleanupFile() when done.
  */
 export async function textToMp3File(
@@ -33,62 +64,49 @@ export async function textToMp3File(
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
 
-  const MAX_RETRIES = 3;
+  const voicesToTry = [voice.id];
+  if (voice.id !== DEFAULT_VOICE.id) voicesToTry.push(DEFAULT_VOICE.id);
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+  let lastErr: Error = new Error("Unknown TTS error");
 
-    try {
-      // Always create a fresh engine — no caching
-      const engine = new MsEdgeTTS();
-      await engine.setMetadata(voice.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-
-      console.log(`[tts] attempt ${attempt} — voice: ${voice.id} — ${clean.length} chars`);
-
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
-          const { audioStream } = engine.toStream(clean);
-          const chunks: Buffer[] = [];
-
-          audioStream.on("data", (chunk: Buffer) => chunks.push(chunk));
-          audioStream.on("end", async () => {
-            try {
-              const buf = Buffer.concat(chunks);
-              if (buf.length === 0) {
-                reject(new Error("Empty audio buffer — server returned no audio"));
-                return;
-              }
-              await writeFile(filePath, buf);
-              resolve();
-            } catch (err) {
-              reject(err);
-            }
-          });
-          audioStream.on("error", reject);
-        }),
-
-        // Timeout — kills the promise if Edge TTS hangs
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`TTS timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
-        ),
-      ]);
-
-      return filePath; // ✅ success
-    } catch (err) {
-      await unlink(filePath).catch(() => {});
-
-      if (attempt === MAX_RETRIES) {
-        console.error(`[tts] all ${MAX_RETRIES} attempts failed:`, (err as Error).message);
-        throw err;
+  for (const voiceId of voicesToTry) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+      try {
+        console.log(`[tts] voice=${voiceId} attempt=${attempt} len=${clean.length}`);
+        await synthesize(clean, voiceId, filePath);
+        return filePath; // ✅
+      } catch (err) {
+        lastErr = err as Error;
+        await unlink(filePath).catch(() => {});
+        console.warn(`[tts] voice=${voiceId} attempt=${attempt} failed: ${lastErr.message}`);
+        if (attempt < 2) await sleep(1000);
       }
-
-      const delay = attempt * 1500; // 1.5 s, 3 s
-      console.warn(`[tts] attempt ${attempt} failed (${(err as Error).message}), retry in ${delay}ms`);
-      await sleep(delay);
     }
   }
 
-  throw new Error("TTS failed after all retries");
+  throw lastErr;
+}
+
+/**
+ * Pre-warm a voice by doing a tiny silent synthesis in the background.
+ * Call this when the user switches voice so the WebSocket is ready before
+ * the pipeline needs it.
+ */
+export function warmUpVoice(voice: VoiceOption): void {
+  const filePath = join(tmpdir(), `wct-warmup-${randomUUID()}.mp3`);
+  const engine = new MsEdgeTTS();
+  engine
+    .setMetadata(voice.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3)
+    .then(() => {
+      const { audioStream } = engine.toStream("Ready.");
+      const chunks: Buffer[] = [];
+      audioStream.on("data", (c: Buffer) => chunks.push(c));
+      audioStream.on("end", () => unlink(filePath).catch(() => {}));
+      audioStream.on("error", () => {});
+    })
+    .catch(() => {});
+  console.log(`[tts] warming up voice: ${voice.id}`);
 }
 
 export async function cleanupFile(filePath: string): Promise<void> {
