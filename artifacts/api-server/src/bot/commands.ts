@@ -1,11 +1,18 @@
-import { SlashCommandBuilder } from "discord.js";
+import { SlashCommandBuilder, ChannelType } from "discord.js";
 
 export const slashCommands = [
   new SlashCommandBuilder()
     .setName("read")
-    .setDescription("Scrape a chapter URL and read it in your voice channel")
+    .setDescription("Scrape a chapter URL and read it in a voice channel")
     .addStringOption((o) =>
       o.setName("url").setDescription("Chapter URL to read").setRequired(true)
+    )
+    .addChannelOption((o) =>
+      o
+        .setName("channel")
+        .setDescription("Voice channel to join (defaults to your current VC)")
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder()
@@ -34,7 +41,7 @@ export const slashCommands = [
     .addStringOption((o) =>
       o
         .setName("name")
-        .setDescription("Voice name, e.g. Jenny, Ryan, Sonia, Emma …")
+        .setDescription("Voice name, e.g. Jenny, Ryan, Sonia, Emma … (leave blank to list all)")
         .setRequired(false)
     ),
 
