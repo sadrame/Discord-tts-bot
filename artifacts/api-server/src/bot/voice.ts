@@ -17,6 +17,8 @@ import {
   Guild,
 } from "discord.js";
 import { textToMp3File, cleanupFile, splitIntoChunks } from "./tts.js";
+import type { VoiceOption } from "./voices.js";
+import { DEFAULT_VOICE } from "./voices.js";
 
 export interface ReadSession {
   guildId: string;
@@ -29,9 +31,21 @@ export interface ReadSession {
   stopped: boolean;
   player: AudioPlayer;
   textChannel: TextBasedChannel;
+  voice: VoiceOption;
 }
 
 const sessions = new Map<string, ReadSession>();
+
+// Per-guild voice preference (persists between reads)
+const guildVoices = new Map<string, VoiceOption>();
+
+export function getGuildVoice(guildId: string): VoiceOption {
+  return guildVoices.get(guildId) ?? DEFAULT_VOICE;
+}
+
+export function setGuildVoice(guildId: string, voice: VoiceOption): void {
+  guildVoices.set(guildId, voice);
+}
 
 export function getSession(guildId: string): ReadSession | undefined {
   return sessions.get(guildId);
@@ -44,7 +58,6 @@ export function stopSession(guildId: string): void {
     session.player.stop(true);
   }
   sessions.delete(guildId);
-
   const conn = getVoiceConnection(guildId);
   conn?.destroy();
 }
@@ -54,10 +67,12 @@ export async function startReading(
   voiceChannel: VoiceBasedChannel,
   textChannel: TextBasedChannel,
   title: string,
-  paragraphs: string[]
+  paragraphs: string[],
+  voice?: VoiceOption
 ): Promise<void> {
-  // Clean up any existing session
   stopSession(guild.id);
+
+  const selectedVoice = voice ?? getGuildVoice(guild.id);
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -74,11 +89,11 @@ export async function startReading(
     stopped: false,
     player,
     textChannel,
+    voice: selectedVoice,
   };
 
   sessions.set(guild.id, session);
 
-  // Join voice channel
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
@@ -93,12 +108,9 @@ export async function startReading(
   }
 
   connection.subscribe(player);
-
-  // Start reading paragraphs
   playNextChunk(session, connection);
 
-  // Handle disconnection
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+  connection.on(VoiceConnectionStatus.Disconnected, () => {
     stopSession(guild.id);
   });
 }
@@ -108,15 +120,11 @@ async function playNextChunk(
   connection: VoiceConnection
 ): Promise<void> {
   if (session.stopped) return;
-  if (session.paused) {
-    // Will be resumed by resumeSession()
-    return;
-  }
+  if (session.paused) return;
 
-  // Build chunk list for current paragraph if exhausted
+  // Advance to next paragraph if current chunk list is exhausted
   while (session.chunkIndex >= session.chunks.length) {
     if (session.paragraphIndex >= session.paragraphs.length) {
-      // Done reading
       await sendMessage(session.textChannel, `✅ Finished reading **${session.title}**!`);
       stopSession(session.guildId);
       return;
@@ -127,7 +135,6 @@ async function playNextChunk(
     session.chunkIndex = 0;
     session.paragraphIndex++;
 
-    // Announce chapter progress every ~10 paragraphs
     if ((session.paragraphIndex - 1) % 10 === 0 && session.paragraphIndex > 1) {
       const pct = Math.round(((session.paragraphIndex - 1) / session.paragraphs.length) * 100);
       await sendMessage(
@@ -142,16 +149,15 @@ async function playNextChunk(
 
   let tmpFile: string | null = null;
   try {
-    tmpFile = await textToMp3File(chunk);
+    tmpFile = await textToMp3File(chunk, session.voice);
     if (session.stopped || session.paused) {
-      await cleanupFile(tmpFile);
+      if (tmpFile) await cleanupFile(tmpFile);
       return;
     }
 
     const resource = createAudioResource(tmpFile, {
       inputType: StreamType.Arbitrary,
     });
-
     session.player.play(resource);
 
     await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
@@ -160,14 +166,13 @@ async function playNextChunk(
     if (!session.stopped) {
       await sendMessage(
         session.textChannel,
-        `⚠️ TTS error on chunk, skipping: ${(err as Error).message}`
+        `⚠️ TTS error, skipping chunk: ${(err as Error).message}`
       );
     }
   } finally {
     if (tmpFile) await cleanupFile(tmpFile);
   }
 
-  // Continue next chunk (recurse via setImmediate to avoid stack overflow on long chapters)
   if (!session.stopped && !session.paused) {
     setImmediate(() => playNextChunk(session, connection));
   }
@@ -189,7 +194,7 @@ export function resumeSession(guildId: string): boolean {
 
   const connection = getVoiceConnection(guildId);
   if (connection) {
-    playNextChunk(session, connection);
+    setImmediate(() => playNextChunk(session, connection));
   }
   return true;
 }
@@ -197,10 +202,9 @@ export function resumeSession(guildId: string): boolean {
 export function skipParagraph(guildId: string): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-
-  // Jump to next paragraph
-  session.chunkIndex = session.chunks.length; // exhaust current paragraph chunks
-  session.player.stop(); // triggers next chunk via the Idle state
+  // Exhaust current paragraph so playNextChunk advances to the next one
+  session.chunkIndex = session.chunks.length;
+  session.player.stop();
   return true;
 }
 

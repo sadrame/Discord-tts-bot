@@ -1,29 +1,33 @@
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
-import { createReadStream } from "fs";
-import { writeFile, unlink, mkdtemp } from "fs/promises";
+import { writeFile, unlink } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
+import type { VoiceOption } from "./voices.js";
+import { DEFAULT_VOICE } from "./voices.js";
 
-// Natural-sounding Microsoft neural TTS voice
-const VOICE = "en-US-JennyNeural";
+// One TTS engine instance per voice id (reused across chunks)
+const engines = new Map<string, MsEdgeTTS>();
 
-let tts: MsEdgeTTS | null = null;
+async function getEngine(voice: VoiceOption): Promise<MsEdgeTTS> {
+  const existing = engines.get(voice.id);
+  if (existing) return existing;
 
-async function getTTS(): Promise<MsEdgeTTS> {
-  if (!tts) {
-    tts = new MsEdgeTTS();
-    await tts.setMetadata(VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-  }
-  return tts;
+  const engine = new MsEdgeTTS();
+  await engine.setMetadata(voice.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+  engines.set(voice.id, engine);
+  return engine;
 }
 
 /**
- * Convert a chunk of text to an MP3 buffer.
- * Returns a temporary file path — caller is responsible for deleting it.
+ * Convert text to an MP3 temp file using the given voice.
+ * Caller is responsible for deleting the file via cleanupFile().
  */
-export async function textToMp3File(text: string): Promise<string> {
-  const engine = await getTTS();
+export async function textToMp3File(
+  text: string,
+  voice: VoiceOption = DEFAULT_VOICE
+): Promise<string> {
+  const engine = await getEngine(voice);
   const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
 
   await new Promise<void>((resolve, reject) => {
@@ -54,8 +58,7 @@ export async function cleanupFile(filePath: string): Promise<void> {
 }
 
 /**
- * Split long text into chunks that TTS can comfortably handle.
- * Splits on sentence boundaries to avoid mid-sentence cuts.
+ * Split long text into TTS-friendly chunks at sentence boundaries.
  */
 export function splitIntoChunks(text: string, maxChars = 1000): string[] {
   const sentences = text.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) ?? [text];
