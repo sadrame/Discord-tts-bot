@@ -6,7 +6,7 @@ import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 
-const TIMEOUT_MS = 20_000;
+const TIMEOUT_MS = 25_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -18,6 +18,24 @@ function sanitizeText(text: string): string {
     .replace(/[^\S\n]+/g, " ")
     .trim();
 }
+
+// ─── Global TTS semaphore ─────────────────────────────────────────────────────
+// Microsoft's Edge TTS WebSocket rejects concurrent connections from the same
+// client. We keep at most ONE synthesis in-flight at a time.
+let ttsInFlight = false;
+const ttsQueue: Array<() => void> = [];
+
+async function acquireTts(): Promise<void> {
+  if (!ttsInFlight) { ttsInFlight = true; return; }
+  await new Promise<void>((resolve) => ttsQueue.push(resolve));
+}
+
+function releaseTts(): void {
+  const next = ttsQueue.shift();
+  if (next) { next(); } else { ttsInFlight = false; }
+}
+
+// ─── Low-level synthesis ──────────────────────────────────────────────────────
 
 async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
   const engine = new MsEdgeTTS();
@@ -44,11 +62,13 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
   ]);
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 /**
- * Convert text to an MP3 temp file using the requested voice.
- * Retries up to 3 times with the SAME voice — no silent fallback to a
- * different voice, which would override the user's selection.
- * Throws if all retries fail; caller decides whether to skip the chunk.
+ * Convert text to an MP3 temp file.
+ * Only ONE synthesis runs at a time (semaphore) to avoid Microsoft rate-limiting
+ * concurrent WebSocket connections.
+ * Retries up to 3 times with the same voice — no silent voice substitution.
  */
 export async function textToMp3File(
   text: string,
@@ -61,6 +81,7 @@ export async function textToMp3File(
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+    await acquireTts();
     try {
       console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
       await synthesize(clean, voice.id, filePath);
@@ -69,7 +90,9 @@ export async function textToMp3File(
       lastErr = err as Error;
       await unlink(filePath).catch(() => {});
       console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-      if (attempt < 3) await sleep(attempt * 800); // 800 ms, 1600 ms
+      if (attempt < 3) await sleep(500);
+    } finally {
+      releaseTts();
     }
   }
 
@@ -96,19 +119,7 @@ export function splitIntoChunks(text: string, maxChars = 400): string[] {
   return chunks.filter((c) => c.length > 0);
 }
 
-/** Fire-and-forget: open a WebSocket for this voice so it's warm when the pipeline needs it. */
-export function warmUpVoice(voice: VoiceOption): void {
-  const filePath = join(tmpdir(), `wct-warmup-${randomUUID()}.mp3`);
-  const engine = new MsEdgeTTS();
-  engine
-    .setMetadata(voice.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3)
-    .then(() => {
-      const { audioStream } = engine.toStream("Ready.");
-      const chunks: Buffer[] = [];
-      audioStream.on("data", (c: Buffer) => chunks.push(c));
-      audioStream.on("end", () => unlink(filePath).catch(() => {}));
-      audioStream.on("error", () => {});
-    })
-    .catch(() => {});
-  console.log(`[tts] warming up ${voice.id}`);
+/** No-op — kept for import compatibility; warmups are removed (they caused concurrent WS conflicts). */
+export function warmUpVoice(_voice: VoiceOption): void {
+  // Intentionally empty — concurrent connections break Edge TTS
 }
