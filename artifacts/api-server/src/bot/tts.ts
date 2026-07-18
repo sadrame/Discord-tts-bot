@@ -77,26 +77,31 @@ export async function textToMp3File(
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
 
-  let lastErr: Error = new Error("Unknown TTS error");
+  // Acquire the semaphore ONCE for all retries — releasing between attempts
+  // lets other callers slip in concurrently, which is exactly what triggers
+  // Microsoft's "stream closed" error.
+  await acquireTts();
+  try {
+    let lastErr: Error = new Error("Unknown TTS error");
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
-    await acquireTts();
-    try {
-      console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
-      await synthesize(clean, voice.id, filePath);
-      return filePath; // ✅
-    } catch (err) {
-      lastErr = err as Error;
-      await unlink(filePath).catch(() => {});
-      console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-      if (attempt < 3) await sleep(500);
-    } finally {
-      releaseTts();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const filePath = join(tmpdir(), `wct-tts-${randomUUID()}.mp3`);
+      try {
+        console.log(`[tts] voice=${voice.id} attempt=${attempt} len=${clean.length}`);
+        await synthesize(clean, voice.id, filePath);
+        return filePath; // ✅
+      } catch (err) {
+        lastErr = err as Error;
+        await unlink(filePath).catch(() => {});
+        console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
+        if (attempt < 3) await sleep(1_000); // wait a beat before retry
+      }
     }
-  }
 
-  throw lastErr;
+    throw lastErr;
+  } finally {
+    releaseTts();
+  }
 }
 
 export async function cleanupFile(filePath: string): Promise<void> {
