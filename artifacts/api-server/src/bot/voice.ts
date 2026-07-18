@@ -31,12 +31,11 @@ export interface ReadSession {
   stopped: boolean;
   player: AudioPlayer;
   textChannel: TextBasedChannel;
-  voice: VoiceOption;
 }
 
 const sessions = new Map<string, ReadSession>();
 
-// Per-guild voice preference (persists between reads)
+// Per-guild voice preference — read per-chunk so /voice takes effect immediately
 const guildVoices = new Map<string, VoiceOption>();
 
 export function getGuildVoice(guildId: string): VoiceOption {
@@ -45,6 +44,7 @@ export function getGuildVoice(guildId: string): VoiceOption {
 
 export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   guildVoices.set(guildId, voice);
+  console.log(`[voice] guild ${guildId} voice → ${voice.id}`);
 }
 
 export function getSession(guildId: string): ReadSession | undefined {
@@ -67,12 +67,9 @@ export async function startReading(
   voiceChannel: VoiceBasedChannel,
   textChannel: TextBasedChannel,
   title: string,
-  paragraphs: string[],
-  voice?: VoiceOption
+  paragraphs: string[]
 ): Promise<void> {
   stopSession(guild.id);
-
-  const selectedVoice = voice ?? getGuildVoice(guild.id);
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -89,7 +86,6 @@ export async function startReading(
     stopped: false,
     player,
     textChannel,
-    voice: selectedVoice,
   };
 
   sessions.set(guild.id, session);
@@ -104,7 +100,7 @@ export async function startReading(
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
   } catch {
     stopSession(guild.id);
-    throw new Error("Could not connect to voice channel within 15 seconds.");
+    throw new Error("Could not connect to the voice channel within 15 seconds.");
   }
 
   connection.subscribe(player);
@@ -122,10 +118,10 @@ async function playNextChunk(
   if (session.stopped) return;
   if (session.paused) return;
 
-  // Advance to next paragraph if current chunk list is exhausted
+  // Advance to next paragraph when current chunk list is exhausted
   while (session.chunkIndex >= session.chunks.length) {
     if (session.paragraphIndex >= session.paragraphs.length) {
-      await sendMessage(session.textChannel, `✅ Finished reading **${session.title}**!`);
+      await safeSend(session.textChannel, `✅ Finished reading **${session.title}**!`);
       stopSession(session.guildId);
       return;
     }
@@ -135,11 +131,12 @@ async function playNextChunk(
     session.chunkIndex = 0;
     session.paragraphIndex++;
 
+    // Progress update every 10 paragraphs
     if ((session.paragraphIndex - 1) % 10 === 0 && session.paragraphIndex > 1) {
       const pct = Math.round(((session.paragraphIndex - 1) / session.paragraphs.length) * 100);
-      await sendMessage(
+      await safeSend(
         session.textChannel,
-        `📖 Reading paragraph ${session.paragraphIndex - 1}/${session.paragraphs.length} (${pct}%)`
+        `📖 Paragraph ${session.paragraphIndex - 1}/${session.paragraphs.length} (${pct}%)`
       );
     }
   }
@@ -147,34 +144,35 @@ async function playNextChunk(
   const chunk = session.chunks[session.chunkIndex]!;
   session.chunkIndex++;
 
+  // Read the guild's current voice preference every chunk — so /voice mid-read works instantly
+  const voice = getGuildVoice(session.guildId);
+
   let tmpFile: string | null = null;
   try {
-    tmpFile = await textToMp3File(chunk, session.voice);
+    tmpFile = await textToMp3File(chunk, voice);
+
     if (session.stopped || session.paused) {
       if (tmpFile) await cleanupFile(tmpFile);
       return;
     }
 
-    const resource = createAudioResource(tmpFile, {
-      inputType: StreamType.Arbitrary,
-    });
+    const resource = createAudioResource(tmpFile, { inputType: StreamType.Arbitrary });
     session.player.play(resource);
 
     await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
     await entersState(session.player, AudioPlayerStatus.Idle, 300_000);
   } catch (err) {
     if (!session.stopped) {
-      await sendMessage(
-        session.textChannel,
-        `⚠️ TTS error, skipping chunk: ${(err as Error).message}`
-      );
+      console.error(`[playNextChunk] TTS failed, skipping chunk: ${(err as Error).message}`);
+      // Don't spam the channel — just log and move on
     }
   } finally {
     if (tmpFile) await cleanupFile(tmpFile);
   }
 
+  // Small breathing room between chunks — reduces WS pressure on Edge TTS
   if (!session.stopped && !session.paused) {
-    setImmediate(() => playNextChunk(session, connection));
+    setTimeout(() => playNextChunk(session, connection), 150);
   }
 }
 
@@ -194,7 +192,7 @@ export function resumeSession(guildId: string): boolean {
 
   const connection = getVoiceConnection(guildId);
   if (connection) {
-    setImmediate(() => playNextChunk(session, connection));
+    setTimeout(() => playNextChunk(session, connection), 150);
   }
   return true;
 }
@@ -202,18 +200,17 @@ export function resumeSession(guildId: string): boolean {
 export function skipParagraph(guildId: string): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  // Exhaust current paragraph so playNextChunk advances to the next one
-  session.chunkIndex = session.chunks.length;
+  session.chunkIndex = session.chunks.length; // exhaust current paragraph
   session.player.stop();
   return true;
 }
 
-async function sendMessage(channel: TextBasedChannel, content: string): Promise<void> {
+async function safeSend(channel: TextBasedChannel, content: string): Promise<void> {
   try {
     if ("send" in channel) {
       await (channel as { send(content: string): Promise<unknown> }).send(content);
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error("[safeSend]", err);
   }
 }
