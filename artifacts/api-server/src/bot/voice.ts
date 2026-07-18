@@ -11,30 +11,38 @@ import {
   AudioPlayerStatus,
   VoiceConnection,
 } from "@discordjs/voice";
-import {
-  VoiceBasedChannel,
-  TextBasedChannel,
-  Guild,
-} from "discord.js";
+import { VoiceBasedChannel, TextBasedChannel, Guild } from "discord.js";
 import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 
+// ─── Session ──────────────────────────────────────────────────────────────────
+
 export interface ReadSession {
   guildId: string;
   title: string;
-  allChunks: string[];   // flat list of every text chunk across all paragraphs
-  chunkIndex: number;    // where we are in allChunks
+  allChunks: string[];
+  chunkIndex: number;
   paused: boolean;
   stopped: boolean;
+  /** Incremented every time the voice changes — lets the pipeline detect stale pre-gens */
+  voiceVersion: number;
   player: AudioPlayer;
   textChannel: TextBasedChannel;
-  // For progress display
-  totalParagraphs: number;
+}
+
+interface ChunkResult {
+  file: string;
+  /** The chunk index this file covers (for backtracking after a voice change) */
+  chunkIdx: number;
+  /** Voice version active when generation started */
+  voiceVersion: number;
 }
 
 const sessions = new Map<string, ReadSession>();
 const guildVoices = new Map<string, VoiceOption>();
+
+// ─── Voice preference ─────────────────────────────────────────────────────────
 
 export function getGuildVoice(guildId: string): VoiceOption {
   return guildVoices.get(guildId) ?? DEFAULT_VOICE;
@@ -42,10 +50,21 @@ export function getGuildVoice(guildId: string): VoiceOption {
 
 export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   guildVoices.set(guildId, voice);
-  console.log(`[voice] guild ${guildId} → ${voice.id}`);
-  // Pre-warm the WebSocket for this voice so the pipeline doesn't cold-start it
+
+  const session = sessions.get(guildId);
+  if (session) {
+    // Bump version so the pipeline discards any pre-buffered old-voice chunk
+    session.voiceVersion++;
+    // Stop the current chunk immediately → creates the "quick pause" before new voice
+    session.player.stop();
+  }
+
+  // Pre-warm the WebSocket so it's ready when the pipeline hits the next chunk
   warmUpVoice(voice);
+  console.log(`[voice] guild ${guildId} → ${voice.id} (version ${session?.voiceVersion ?? 0})`);
 }
+
+// ─── Session lifecycle ────────────────────────────────────────────────────────
 
 export function getSession(guildId: string): ReadSession | undefined {
   return sessions.get(guildId);
@@ -70,11 +89,8 @@ export async function startReading(
 ): Promise<void> {
   stopSession(guild.id);
 
-  // Flatten all paragraphs into one chunk list up front
   const allChunks: string[] = [];
-  for (const para of paragraphs) {
-    allChunks.push(...splitIntoChunks(para));
-  }
+  for (const para of paragraphs) allChunks.push(...splitIntoChunks(para));
 
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -87,9 +103,9 @@ export async function startReading(
     chunkIndex: 0,
     paused: false,
     stopped: false,
+    voiceVersion: 0,
     player,
     textChannel,
-    totalParagraphs: paragraphs.length,
   };
 
   sessions.set(guild.id, session);
@@ -110,57 +126,62 @@ export async function startReading(
   connection.subscribe(player);
   connection.on(VoiceConnectionStatus.Disconnected, () => stopSession(guild.id));
 
-  // Run the pipeline — don't await, let it run in background
   runPipeline(session, connection).catch((err) =>
     console.error("[pipeline] uncaught:", err)
   );
 }
 
-/**
- * Pipelined reading loop:
- *   While chunk N is *playing*, chunk N+1 is already being *generated*.
- *   This eliminates the gap between sentences.
- */
+// ─── Pipelined reading loop ───────────────────────────────────────────────────
+//
+// While chunk N is *playing*, chunk N+1 is already being *generated*.
+// On voice switch: current chunk stops immediately (player.stop in setGuildVoice),
+// voiceVersion bumps, and any pre-generated stale chunk is discarded + re-generated
+// with the new voice before playback resumes.
+
 async function runPipeline(session: ReadSession, connection: VoiceConnection): Promise<void> {
-  // Pre-generate the very first chunk
-  let nextFile = await generateChunk(session);
+  let next = await generateChunk(session);
 
-  while (nextFile !== null && !session.stopped) {
+  while (next !== null && !session.stopped) {
+    // ── Pause handling ──────────────────────────────────────────────────────
     if (session.paused) {
-      // Clean up the pre-generated file and wait until resumed
-      await cleanupFile(nextFile);
-      nextFile = null;
-
-      // Poll for resume
-      while (session.paused && !session.stopped) {
-        await sleep(200);
-      }
+      await cleanupFile(next.file);
+      while (session.paused && !session.stopped) await sleep(200);
       if (session.stopped) break;
-
-      // Regenerate from current position after resume
-      nextFile = await generateChunk(session);
+      next = await generateChunk(session);
       continue;
     }
 
-    const currentFile = nextFile;
+    const current = next;
+    const versionAtKickoff = session.voiceVersion;
 
-    // Kick off generation of the NEXT chunk in parallel while this one plays
-    const nextGenPromise = generateChunk(session);
+    // Kick off next chunk generation in parallel while this one plays
+    const nextPromise = generateChunk(session);
 
-    // Play the current chunk
+    // ── Play current chunk ──────────────────────────────────────────────────
     try {
-      const resource = createAudioResource(currentFile, { inputType: StreamType.Arbitrary });
+      const resource = createAudioResource(current.file, { inputType: StreamType.Arbitrary });
       session.player.play(resource);
       await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
       await entersState(session.player, AudioPlayerStatus.Idle, 300_000);
-    } catch (err) {
-      console.error("[pipeline] play error:", (err as Error).message);
+    } catch {
+      // Player was stopped (e.g. voice change) — that's fine, continue
     } finally {
-      await cleanupFile(currentFile);
+      await cleanupFile(current.file);
     }
 
-    // Grab the pre-generated next chunk (usually already ready by now)
-    nextFile = await nextGenPromise;
+    // ── Voice-change check ──────────────────────────────────────────────────
+    // Wait for the pre-gen to finish regardless so we can clean it up if needed
+    const preGen = await nextPromise;
+
+    if (preGen && session.voiceVersion !== versionAtKickoff) {
+      // Voice changed while we were playing — the pre-gen used the wrong voice.
+      // Discard it, back up the chunk index to that position, and re-generate.
+      await cleanupFile(preGen.file);
+      session.chunkIndex = preGen.chunkIdx; // rewind to that chunk
+      next = await generateChunk(session);
+    } else {
+      next = preGen;
+    }
   }
 
   if (!session.stopped) {
@@ -169,38 +190,39 @@ async function runPipeline(session: ReadSession, connection: VoiceConnection): P
   }
 }
 
-/**
- * Generate the TTS file for the current chunk and advance the index.
- * Returns null when there are no more chunks.
- */
-async function generateChunk(session: ReadSession): Promise<string | null> {
-  // Skip over any already-consumed index (e.g. after a skip)
+// ─── Chunk generation ─────────────────────────────────────────────────────────
+
+async function generateChunk(session: ReadSession): Promise<ChunkResult | null> {
+  // Find the next non-empty chunk
   while (session.chunkIndex < session.allChunks.length) {
-    const text = session.allChunks[session.chunkIndex]!;
-    session.chunkIndex++;
+    if (session.stopped) return null;
+
+    const chunkIdx = session.chunkIndex++;
+    const text = session.allChunks[chunkIdx]!;
+    const capturedVersion = session.voiceVersion;
 
     // Progress update every 20 chunks
-    if (session.chunkIndex % 20 === 0) {
-      const pct = Math.round((session.chunkIndex / session.allChunks.length) * 100);
+    if (chunkIdx > 0 && chunkIdx % 20 === 0) {
+      const pct = Math.round((chunkIdx / session.allChunks.length) * 100);
       safeSend(session.textChannel, `📖 ${pct}% through **${session.title}**`).catch(() => {});
     }
 
-    if (session.stopped) return null;
-
-    const voice = getGuildVoice(session.guildId); // re-read every chunk so /voice works mid-read
+    const voice = getGuildVoice(session.guildId);
 
     try {
       const file = await textToMp3File(text, voice);
-      return file;
+      return { file, chunkIdx, voiceVersion: capturedVersion };
     } catch (err) {
-      // Log but don't send to channel — just skip the chunk silently
-      console.error(`[generateChunk] skipping chunk after TTS failure: ${(err as Error).message}`);
-      // continue to next chunk in the loop
+      // textToMp3File already tried the fallback voice internally — if it still
+      // throws, just skip this chunk silently and move on
+      console.error(`[generateChunk] skipping chunk ${chunkIdx}: ${(err as Error).message}`);
     }
   }
 
   return null; // all chunks exhausted
 }
+
+// ─── Controls ────────────────────────────────────────────────────────────────
 
 export function pauseSession(guildId: string): boolean {
   const session = sessions.get(guildId);
@@ -221,13 +243,14 @@ export function resumeSession(guildId: string): boolean {
 export function skipParagraph(guildId: string): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  // Advance ~10 chunks (roughly one paragraph worth)
   session.chunkIndex = Math.min(session.chunkIndex + 10, session.allChunks.length);
-  session.player.stop(); // triggers Idle → pipeline moves on
+  session.player.stop();
   return true;
 }
 
-export function getProgressInfo(guildId: string): { index: number; total: number; title: string; paused: boolean } | null {
+export function getProgressInfo(
+  guildId: string
+): { index: number; total: number; title: string; paused: boolean } | null {
   const session = sessions.get(guildId);
   if (!session) return null;
   return {
@@ -237,6 +260,8 @@ export function getProgressInfo(guildId: string): { index: number; total: number
     paused: session.paused,
   };
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
