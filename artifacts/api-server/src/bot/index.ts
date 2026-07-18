@@ -25,6 +25,7 @@ import {
   resumeSession,
   skipParagraph,
   getSession,
+  getProgressInfo,
   getGuildVoice,
   setGuildVoice,
 } from "./voice.js";
@@ -211,15 +212,15 @@ function handleSkip(guildId: string): string {
 }
 
 function handleProgress(guildId: string): string {
-  const session = getSession(guildId);
-  if (!session) return "❌ Nothing is currently playing.";
-  const pct = Math.round((session.paragraphIndex / session.paragraphs.length) * 100);
+  const info = getProgressInfo(guildId);
+  if (!info) return "❌ Nothing is currently playing.";
+  const pct = Math.round((info.index / info.total) * 100);
   const bar = buildProgressBar(pct);
   return (
-    `📖 **${session.title}**\n` +
+    `📖 **${info.title}**\n` +
     `${bar} ${pct}%\n` +
-    `Paragraph ${session.paragraphIndex}/${session.paragraphs.length}` +
-    (session.paused ? " *(paused)*" : "")
+    `Chunk ${info.index}/${info.total}` +
+    (info.paused ? " *(paused)*" : "")
   );
 }
 

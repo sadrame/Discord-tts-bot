@@ -23,19 +23,17 @@ import { DEFAULT_VOICE } from "./voices.js";
 export interface ReadSession {
   guildId: string;
   title: string;
-  paragraphs: string[];
-  paragraphIndex: number;
-  chunkIndex: number;
-  chunks: string[];
+  allChunks: string[];   // flat list of every text chunk across all paragraphs
+  chunkIndex: number;    // where we are in allChunks
   paused: boolean;
   stopped: boolean;
   player: AudioPlayer;
   textChannel: TextBasedChannel;
+  // For progress display
+  totalParagraphs: number;
 }
 
 const sessions = new Map<string, ReadSession>();
-
-// Per-guild voice preference — read per-chunk so /voice takes effect immediately
 const guildVoices = new Map<string, VoiceOption>();
 
 export function getGuildVoice(guildId: string): VoiceOption {
@@ -44,7 +42,7 @@ export function getGuildVoice(guildId: string): VoiceOption {
 
 export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   guildVoices.set(guildId, voice);
-  console.log(`[voice] guild ${guildId} voice → ${voice.id}`);
+  console.log(`[voice] guild ${guildId} → ${voice.id}`);
 }
 
 export function getSession(guildId: string): ReadSession | undefined {
@@ -58,8 +56,7 @@ export function stopSession(guildId: string): void {
     session.player.stop(true);
   }
   sessions.delete(guildId);
-  const conn = getVoiceConnection(guildId);
-  conn?.destroy();
+  getVoiceConnection(guildId)?.destroy();
 }
 
 export async function startReading(
@@ -71,6 +68,12 @@ export async function startReading(
 ): Promise<void> {
   stopSession(guild.id);
 
+  // Flatten all paragraphs into one chunk list up front
+  const allChunks: string[] = [];
+  for (const para of paragraphs) {
+    allChunks.push(...splitIntoChunks(para));
+  }
+
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
   });
@@ -78,14 +81,13 @@ export async function startReading(
   const session: ReadSession = {
     guildId: guild.id,
     title,
-    paragraphs,
-    paragraphIndex: 0,
+    allChunks,
     chunkIndex: 0,
-    chunks: [],
     paused: false,
     stopped: false,
     player,
     textChannel,
+    totalParagraphs: paragraphs.length,
   };
 
   sessions.set(guild.id, session);
@@ -104,76 +106,98 @@ export async function startReading(
   }
 
   connection.subscribe(player);
-  playNextChunk(session, connection);
+  connection.on(VoiceConnectionStatus.Disconnected, () => stopSession(guild.id));
 
-  connection.on(VoiceConnectionStatus.Disconnected, () => {
-    stopSession(guild.id);
-  });
+  // Run the pipeline — don't await, let it run in background
+  runPipeline(session, connection).catch((err) =>
+    console.error("[pipeline] uncaught:", err)
+  );
 }
 
-async function playNextChunk(
-  session: ReadSession,
-  connection: VoiceConnection
-): Promise<void> {
-  if (session.stopped) return;
-  if (session.paused) return;
+/**
+ * Pipelined reading loop:
+ *   While chunk N is *playing*, chunk N+1 is already being *generated*.
+ *   This eliminates the gap between sentences.
+ */
+async function runPipeline(session: ReadSession, connection: VoiceConnection): Promise<void> {
+  // Pre-generate the very first chunk
+  let nextFile = await generateChunk(session);
 
-  // Advance to next paragraph when current chunk list is exhausted
-  while (session.chunkIndex >= session.chunks.length) {
-    if (session.paragraphIndex >= session.paragraphs.length) {
-      await safeSend(session.textChannel, `✅ Finished reading **${session.title}**!`);
-      stopSession(session.guildId);
-      return;
+  while (nextFile !== null && !session.stopped) {
+    if (session.paused) {
+      // Clean up the pre-generated file and wait until resumed
+      await cleanupFile(nextFile);
+      nextFile = null;
+
+      // Poll for resume
+      while (session.paused && !session.stopped) {
+        await sleep(200);
+      }
+      if (session.stopped) break;
+
+      // Regenerate from current position after resume
+      nextFile = await generateChunk(session);
+      continue;
     }
 
-    const para = session.paragraphs[session.paragraphIndex]!;
-    session.chunks = splitIntoChunks(para);
-    session.chunkIndex = 0;
-    session.paragraphIndex++;
+    const currentFile = nextFile;
 
-    // Progress update every 10 paragraphs
-    if ((session.paragraphIndex - 1) % 10 === 0 && session.paragraphIndex > 1) {
-      const pct = Math.round(((session.paragraphIndex - 1) / session.paragraphs.length) * 100);
-      await safeSend(
-        session.textChannel,
-        `📖 Paragraph ${session.paragraphIndex - 1}/${session.paragraphs.length} (${pct}%)`
-      );
+    // Kick off generation of the NEXT chunk in parallel while this one plays
+    const nextGenPromise = generateChunk(session);
+
+    // Play the current chunk
+    try {
+      const resource = createAudioResource(currentFile, { inputType: StreamType.Arbitrary });
+      session.player.play(resource);
+      await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
+      await entersState(session.player, AudioPlayerStatus.Idle, 300_000);
+    } catch (err) {
+      console.error("[pipeline] play error:", (err as Error).message);
+    } finally {
+      await cleanupFile(currentFile);
+    }
+
+    // Grab the pre-generated next chunk (usually already ready by now)
+    nextFile = await nextGenPromise;
+  }
+
+  if (!session.stopped) {
+    await safeSend(session.textChannel, `✅ Finished reading **${session.title}**!`);
+    stopSession(session.guildId);
+  }
+}
+
+/**
+ * Generate the TTS file for the current chunk and advance the index.
+ * Returns null when there are no more chunks.
+ */
+async function generateChunk(session: ReadSession): Promise<string | null> {
+  // Skip over any already-consumed index (e.g. after a skip)
+  while (session.chunkIndex < session.allChunks.length) {
+    const text = session.allChunks[session.chunkIndex]!;
+    session.chunkIndex++;
+
+    // Progress update every 20 chunks
+    if (session.chunkIndex % 20 === 0) {
+      const pct = Math.round((session.chunkIndex / session.allChunks.length) * 100);
+      safeSend(session.textChannel, `📖 ${pct}% through **${session.title}**`).catch(() => {});
+    }
+
+    if (session.stopped) return null;
+
+    const voice = getGuildVoice(session.guildId); // re-read every chunk so /voice works mid-read
+
+    try {
+      const file = await textToMp3File(text, voice);
+      return file;
+    } catch (err) {
+      // Log but don't send to channel — just skip the chunk silently
+      console.error(`[generateChunk] skipping chunk after TTS failure: ${(err as Error).message}`);
+      // continue to next chunk in the loop
     }
   }
 
-  const chunk = session.chunks[session.chunkIndex]!;
-  session.chunkIndex++;
-
-  // Read the guild's current voice preference every chunk — so /voice mid-read works instantly
-  const voice = getGuildVoice(session.guildId);
-
-  let tmpFile: string | null = null;
-  try {
-    tmpFile = await textToMp3File(chunk, voice);
-
-    if (session.stopped || session.paused) {
-      if (tmpFile) await cleanupFile(tmpFile);
-      return;
-    }
-
-    const resource = createAudioResource(tmpFile, { inputType: StreamType.Arbitrary });
-    session.player.play(resource);
-
-    await entersState(session.player, AudioPlayerStatus.Playing, 10_000);
-    await entersState(session.player, AudioPlayerStatus.Idle, 300_000);
-  } catch (err) {
-    if (!session.stopped) {
-      console.error(`[playNextChunk] TTS failed, skipping chunk: ${(err as Error).message}`);
-      // Don't spam the channel — just log and move on
-    }
-  } finally {
-    if (tmpFile) await cleanupFile(tmpFile);
-  }
-
-  // Small breathing room between chunks — reduces WS pressure on Edge TTS
-  if (!session.stopped && !session.paused) {
-    setTimeout(() => playNextChunk(session, connection), 150);
-  }
+  return null; // all chunks exhausted
 }
 
 export function pauseSession(guildId: string): boolean {
@@ -189,20 +213,31 @@ export function resumeSession(guildId: string): boolean {
   if (!session || !session.paused) return false;
   session.paused = false;
   session.player.unpause();
-
-  const connection = getVoiceConnection(guildId);
-  if (connection) {
-    setTimeout(() => playNextChunk(session, connection), 150);
-  }
   return true;
 }
 
 export function skipParagraph(guildId: string): boolean {
   const session = sessions.get(guildId);
   if (!session) return false;
-  session.chunkIndex = session.chunks.length; // exhaust current paragraph
-  session.player.stop();
+  // Advance ~10 chunks (roughly one paragraph worth)
+  session.chunkIndex = Math.min(session.chunkIndex + 10, session.allChunks.length);
+  session.player.stop(); // triggers Idle → pipeline moves on
   return true;
+}
+
+export function getProgressInfo(guildId: string): { index: number; total: number; title: string; paused: boolean } | null {
+  const session = sessions.get(guildId);
+  if (!session) return null;
+  return {
+    index: session.chunkIndex,
+    total: session.allChunks.length,
+    title: session.title,
+    paused: session.paused,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function safeSend(channel: TextBasedChannel, content: string): Promise<void> {
