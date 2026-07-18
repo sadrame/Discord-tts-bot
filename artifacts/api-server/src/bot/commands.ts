@@ -37,13 +37,7 @@ export const slashCommands = [
 
   new SlashCommandBuilder()
     .setName("voice")
-    .setDescription("Change the TTS voice (persists between reads)")
-    .addStringOption((o) =>
-      o
-        .setName("name")
-        .setDescription("Voice name, e.g. Jenny, Ryan, Sonia, Emma … (leave blank to list all)")
-        .setRequired(false)
-    ),
+    .setDescription("Pick a TTS voice from a dropdown menu"),
 
   new SlashCommandBuilder()
     .setName("help")
