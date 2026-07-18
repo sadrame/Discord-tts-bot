@@ -19,9 +19,30 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
+// ─── Persistent engine cache ──────────────────────────────────────────────────
+// Re-using the same MsEdgeTTS instance keeps the WebSocket alive across chunks,
+// avoiding the per-chunk reconnect that causes Microsoft to rate-limit us.
+// On any failure the entry is evicted so the next attempt gets a fresh socket.
+const engineCache = new Map<string, MsEdgeTTS>();
+
+async function getEngine(voiceId: string): Promise<MsEdgeTTS> {
+  const cached = engineCache.get(voiceId);
+  if (cached) return cached;
+
+  const engine = new MsEdgeTTS();
+  await engine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+  engineCache.set(voiceId, engine);
+  console.log(`[tts] new WS connection for ${voiceId}`);
+  return engine;
+}
+
+function evictEngine(voiceId: string): void {
+  engineCache.delete(voiceId);
+}
+
 // ─── Global TTS semaphore ─────────────────────────────────────────────────────
-// Microsoft's Edge TTS WebSocket rejects concurrent connections from the same
-// client. We keep at most ONE synthesis in-flight at a time.
+// Only ONE synthesis runs at a time. Acquired ONCE per textToMp3File call
+// (covering all retries) so retries never let another caller sneak in.
 let ttsInFlight = false;
 const ttsQueue: Array<() => void> = [];
 
@@ -38,8 +59,7 @@ function releaseTts(): void {
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
 async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
-  const engine = new MsEdgeTTS();
-  await engine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+  const engine = await getEngine(voiceId);
 
   await Promise.race([
     new Promise<void>((resolve, reject) => {
@@ -66,9 +86,12 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
 
 /**
  * Convert text to an MP3 temp file.
- * Only ONE synthesis runs at a time (semaphore) to avoid Microsoft rate-limiting
- * concurrent WebSocket connections.
- * Retries up to 3 times with the same voice — no silent voice substitution.
+ *
+ * - Reuses a cached MsEdgeTTS instance (persistent WebSocket) per voice to
+ *   avoid Microsoft rate-limiting from repeated connection handshakes.
+ * - Evicts the cached instance on failure so the next retry gets a fresh socket.
+ * - Holds the global semaphore for all retries so no other synthesis can
+ *   interleave — concurrent WebSockets to Edge TTS cause "stream closed".
  */
 export async function textToMp3File(
   text: string,
@@ -77,9 +100,6 @@ export async function textToMp3File(
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
 
-  // Acquire the semaphore ONCE for all retries — releasing between attempts
-  // lets other callers slip in concurrently, which is exactly what triggers
-  // Microsoft's "stream closed" error.
   await acquireTts();
   try {
     let lastErr: Error = new Error("Unknown TTS error");
@@ -93,8 +113,11 @@ export async function textToMp3File(
       } catch (err) {
         lastErr = err as Error;
         await unlink(filePath).catch(() => {});
+        // Evict the cached engine — the WebSocket is likely dead or blacklisted.
+        // Next attempt (or next call) will open a fresh connection.
+        evictEngine(voice.id);
         console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-        if (attempt < 3) await sleep(1_000); // wait a beat before retry
+        if (attempt < 3) await sleep(1_500);
       }
     }
 
@@ -124,7 +147,7 @@ export function splitIntoChunks(text: string, maxChars = 400): string[] {
   return chunks.filter((c) => c.length > 0);
 }
 
-/** No-op — kept for import compatibility; warmups are removed (they caused concurrent WS conflicts). */
+/** No-op — kept for import compatibility. */
 export function warmUpVoice(_voice: VoiceOption): void {
   // Intentionally empty — concurrent connections break Edge TTS
 }
