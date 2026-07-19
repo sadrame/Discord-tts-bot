@@ -401,6 +401,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
+// ─── Tiny health server for Render / UptimeRobot ─────────────────────────────
+// Render requires a web service to bind a port. This keeps UptimeRobot happy
+// without needing a separate API server process.
+import { createServer } from "http";
+const PORT = process.env["PORT"] ? parseInt(process.env["PORT"]) : 3000;
+createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}).listen(PORT, () => console.log(`✅ Health server listening on port ${PORT}`));
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
 const token = process.env["DISCORD_BOT_TOKEN"];
 if (!token) { console.error("DISCORD_BOT_TOKEN is not set."); process.exit(1); }
 
