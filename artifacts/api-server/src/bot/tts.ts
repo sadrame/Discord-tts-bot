@@ -19,49 +19,35 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-/**
- * Build SSML with the specific voice embedded.
- * Using rawToStream() with this SSML lets us use ANY voice on a SINGLE shared
- * WebSocket — no reconnection needed when the voice changes.
- */
-function buildSsml(text: string, voiceId: string): string {
-  // Infer locale from voice ID: "en-US-JennyNeural" → "en-US"
-  const locale = voiceId.match(/^([a-z]{2}-[A-Z]{2})/)?.[1] ?? "en-US";
-  return (
-    `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" ` +
-    `xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${locale}">` +
-    `<voice name="${voiceId}">${escapeXml(text)}</voice>` +
-    `</speak>`
-  );
-}
-
 // ─── Single shared WebSocket engine ──────────────────────────────────────────
 // ONE MsEdgeTTS instance for ALL voices.
-// Voice is specified per-request via SSML (<voice name="...">) using rawToStream().
-// This avoids the per-voice reconnect that causes Microsoft to block connections.
+// When the voice changes, setMetadata() triggers ONE reconnect.
+// When the voice stays the same, the open connection is reused (zero overhead).
+// This avoids the rapid reconnect rate-limiting that broke non-Jenny voices.
 let sharedEngine: MsEdgeTTS | null = null;
+let engineVoiceId: string | null = null; // tracks what voice the engine is set to
 
-async function getEngine(): Promise<MsEdgeTTS> {
-  if (sharedEngine) return sharedEngine;
-  const engine = new MsEdgeTTS();
-  // Connect with Jenny — actual voice is overridden per-request in the SSML
-  await engine.setMetadata(DEFAULT_VOICE.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-  sharedEngine = engine;
-  console.log("[tts] WebSocket established (shared for all voices)");
-  return engine;
+async function getEngine(voiceId: string): Promise<MsEdgeTTS> {
+  if (sharedEngine && engineVoiceId === voiceId) {
+    // Same voice — reuse the open connection
+    return sharedEngine;
+  }
+
+  if (!sharedEngine) {
+    sharedEngine = new MsEdgeTTS();
+    console.log("[tts] Creating new MsEdgeTTS instance");
+  }
+
+  // Voice changed (or first init) — setMetadata reconnects once
+  await sharedEngine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+  engineVoiceId = voiceId;
+  console.log(`[tts] WebSocket set to voice: ${voiceId}`);
+  return sharedEngine;
 }
 
 function invalidateEngine(): void {
   sharedEngine = null;
+  engineVoiceId = null;
   console.log("[tts] WebSocket invalidated — will reconnect on next request");
 }
 
@@ -83,14 +69,13 @@ function releaseTts(): void {
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
 async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
-  const engine = await getEngine();
-  const ssml   = buildSsml(text, voiceId);
+  const engine = await getEngine(voiceId);
 
   await Promise.race([
     new Promise<void>((resolve, reject) => {
-      // rawToStream sends our pre-built SSML directly — voice name is inside it,
-      // so any of the 20+ voices work without a new WebSocket connection.
-      const { audioStream } = engine.rawToStream(ssml);
+      // toStream() uses the voice already set via setMetadata() above.
+      // The engine's voice matches voiceId — no SSML tricks needed.
+      const { audioStream } = engine.toStream(text);
       const chunks: Buffer[] = [];
       audioStream.on("data", (c: Buffer) => chunks.push(c));
       audioStream.on("end", async () => {
@@ -114,8 +99,9 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
 /**
  * Convert text to an MP3 temp file.
  *
- * Uses a single shared WebSocket (rawToStream + per-request SSML) so all
- * voices work without reconnecting. Retries invalidate and reconnect on failure.
+ * Uses a single shared WebSocket. When the voice changes, setMetadata()
+ * triggers exactly ONE reconnect — safe and not rate-limited. On failure,
+ * the engine is invalidated and reconnected fresh on the next attempt.
  * The global semaphore ensures only one synthesis is in-flight at a time.
  */
 export async function textToMp3File(
@@ -139,7 +125,7 @@ export async function textToMp3File(
         lastErr = err as Error;
         await unlink(filePath).catch(() => {});
         // Invalidate the shared engine — stale or rate-limited connection.
-        // Next attempt creates a fresh WebSocket.
+        // Next attempt creates a fresh WebSocket with the correct voice.
         invalidateEngine();
         console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
         if (attempt < 3) await sleep(2_000);
