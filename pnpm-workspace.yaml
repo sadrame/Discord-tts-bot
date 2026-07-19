@@ -37,8 +37,10 @@ minimumReleaseAgeExclude:
   - stripe-replit-sync
 
 onlyBuiltDependencies:
+  - '@discordjs/opus'
   - '@swc/core'
   - esbuild
+  - msedge-tts
   - msw
   - unrs-resolver
 
