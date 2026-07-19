@@ -261,6 +261,7 @@ const client = new Client({
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ WCT Reader Bot ready! Logged in as ${c.user.tag}`);
+  console.log(`🎙️ Voices loaded: ${VOICES.map(v => v.label).join(", ")}`);
   c.user.setActivity("📖 /help or !help");
   try {
     const rest = new REST().setToken(process.env["DISCORD_BOT_TOKEN"]!);
