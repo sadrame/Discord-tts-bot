@@ -15,7 +15,7 @@ export const VOICES: VoiceOption[] = [
   { id: "en-US-JennyNeural",    label: "Jenny",    accent: "American",   gender: "Female", style: "Friendly, warm" },
   { id: "en-US-AriaNeural",     label: "Aria",     accent: "American",   gender: "Female", style: "Expressive, clear" },
   { id: "en-US-EmmaNeural",     label: "Emma",     accent: "American",   gender: "Female", style: "Expressive" },
-  { id: "en-US-SaraNeural",     label: "Sara",     accent: "American",   gender: "Female", style: "Cheerful" },
+  { id: "en-US-AvaNeural",      label: "Ava",      accent: "American",   gender: "Female", style: "Cheerful" },
   { id: "en-US-NancyNeural",    label: "Nancy",    accent: "American",   gender: "Female", style: "Pleasant" },
   { id: "en-US-GuyNeural",      label: "Guy",      accent: "American",   gender: "Male",   style: "Professional" },
   { id: "en-US-DavisNeural",    label: "Davis",    accent: "American",   gender: "Male",   style: "Casual" },
