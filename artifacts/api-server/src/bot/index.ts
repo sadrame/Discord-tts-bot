@@ -29,6 +29,7 @@ import {
   getGuildVoice,
   setGuildVoice,
 } from "./voice.js";
+import { getBookmark } from "./bookmarks.js";
 import { VOICES } from "./voices.js";
 import { slashCommands } from "./commands.js";
 
@@ -50,7 +51,7 @@ function helpText(): string {
     "📖 **WCT Reader Bot**",
     "",
     "`/read <url> [channel]` — fetch a chapter and read it aloud",
-    "`/stop` — stop reading and leave voice",
+    "`/stop` — stop reading and leave voice (saves your position)",
     "`/pause` — pause playback",
     "`/resume` — resume playback",
     "`/skip` — skip current paragraph",
@@ -59,6 +60,8 @@ function helpText(): string {
     "`/help` — show this message",
     "",
     "All commands also work with the `!` prefix.",
+    "Supports WitchCultTranslations and AO3 links.",
+    "Your position is saved when you `!stop` — re-reading the same URL resumes automatically.",
   ].join("\n");
 }
 
@@ -83,8 +86,8 @@ function buildVoiceMenu(guildId: string): ActionRowBuilder<StringSelectMenuBuild
     const flag   = ACCENT_FLAG[v.accent] ?? "🌐";
     const gender = v.gender === "Female" ? "♀" : "♂";
     return {
-      label:       v.label,                                        // e.g. "Jenny"
-      description: `${flag} ${v.accent} ${gender} · ${v.style}`, // e.g. "🇺🇸 American ♀ · Friendly, warm"
+      label:       v.label,
+      description: `${flag} ${v.accent} ${gender} · ${v.style}`,
       value:       v.id,
       default:     v.id === currentVoice.id,
     };
@@ -98,7 +101,6 @@ function buildVoiceMenu(guildId: string): ActionRowBuilder<StringSelectMenuBuild
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
 }
 
-/** Send (or edit) a voice picker and return the bot message for later editing. */
 async function sendVoicePicker(
   guildId: string,
   sendFn: (payload: { content: string; components: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
@@ -186,6 +188,20 @@ async function handleRead(
   try { chapter = await scrapeChapter(url); }
   catch (err) { await safeSend(textChannel, `❌ Could not read that page: ${(err as Error).message}`); return; }
 
+  // ── Check for saved bookmark ─────────────────────────────────────────────
+  let resumeFromChunk = 0;
+  try {
+    const bookmark = await getBookmark(guildId);
+    if (bookmark && bookmark.url === url && bookmark.chunkIndex > 0) {
+      resumeFromChunk = bookmark.chunkIndex;
+      const pct = Math.round((bookmark.chunkIndex / bookmark.totalChunks) * 100);
+      await safeSend(
+        textChannel,
+        `📌 Resuming **${bookmark.title}** from where you left off — chunk ${bookmark.chunkIndex}/${bookmark.totalChunks} (${pct}% done).`
+      );
+    }
+  } catch { /* non-fatal */ }
+
   const voice = getGuildVoice(guildId);
   await safeSend(
     textChannel,
@@ -193,14 +209,17 @@ async function handleRead(
     `🎙️ Voice: **${voice.label}** — ${voice.accent} ${voice.gender} | Joining **${voiceChannel.name}**`
   );
 
-  try { await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs); }
-  catch (err) { await safeSend(textChannel, `❌ Voice error: ${(err as Error).message}`); }
+  try {
+    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, resumeFromChunk);
+  } catch (err) {
+    await safeSend(textChannel, `❌ Voice error: ${(err as Error).message}`);
+  }
 }
 
-function handleStop(guildId: string): string {
+async function handleStop(guildId: string): Promise<string> {
   if (!getSession(guildId)) return "❌ Nothing is currently playing.";
-  stopSession(guildId);
-  return "⏹️ Stopped and left the voice channel.";
+  await stopSession(guildId);
+  return "⏹️ Stopped and left the voice channel. Your position has been saved — read the same URL to resume.";
 }
 
 function handlePause(guildId: string): string {
@@ -271,7 +290,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     const gender = picked.gender === "Female" ? "♀" : "♂";
     await sel.update({
       content:    `✅ Voice switched to **${picked.label}** ${flag} ${gender} · *${picked.style}*`,
-      components: [], // remove the dropdown
+      components: [],
     }).catch(() => {});
     return;
   }
@@ -299,12 +318,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         );
         break;
       }
-      case "stop":     await editReply(handleStop(guildId));     break;
-      case "pause":    await editReply(handlePause(guildId));    break;
-      case "resume":   await editReply(handleResume(guildId));   break;
-      case "skip":     await editReply(handleSkip(guildId));     break;
-      case "progress": await editReply(handleProgress(guildId)); break;
-      case "help":     await editReply(helpText());              break;
+      case "stop":     await editReply(await handleStop(guildId)); break;
+      case "pause":    await editReply(handlePause(guildId));      break;
+      case "resume":   await editReply(handleResume(guildId));     break;
+      case "skip":     await editReply(handleSkip(guildId));       break;
+      case "progress": await editReply(handleProgress(guildId));   break;
+      case "help":     await editReply(helpText());                break;
 
       case "voice":
         await sendVoicePicker(guildId,
@@ -354,7 +373,6 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
 
       case "voice": {
-        // Show the dropdown select menu in the channel
         try {
           await message.reply({
             content:    `🎙️ Current voice: **${getGuildVoice(guildId).label}** — pick a new one below:`,
@@ -364,12 +382,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
         return;
       }
 
-      case "stop":     reply = handleStop(guildId);     break;
-      case "pause":    reply = handlePause(guildId);    break;
-      case "resume":   reply = handleResume(guildId);   break;
-      case "skip":     reply = handleSkip(guildId);     break;
-      case "progress": reply = handleProgress(guildId); break;
-      case "help":     reply = helpText();              break;
+      case "stop":     reply = await handleStop(guildId); break;
+      case "pause":    reply = handlePause(guildId);      break;
+      case "resume":   reply = handleResume(guildId);     break;
+      case "skip":     reply = handleSkip(guildId);       break;
+      case "progress": reply = handleProgress(guildId);   break;
+      case "help":     reply = helpText();                break;
       default: return;
     }
   } catch (err) {

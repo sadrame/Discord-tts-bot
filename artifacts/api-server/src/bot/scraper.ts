@@ -17,6 +17,11 @@ const SELECTORS_BY_HOST: Record<string, { content: string[]; title: string[] }> 
     title: [".entry-title", "h1"],
     content: [".entry-content", ".post-content"],
   },
+  // Archive of Our Own — chapters live in .userstuff[role="article"]
+  "archiveofourown.org": {
+    title: ["h2.title.heading", "h3.title", "h2.title"],
+    content: [".userstuff[role='article']", "#chapters .userstuff", ".userstuff"],
+  },
 };
 
 const GENERIC_CONTENT_SELECTORS = [
@@ -70,12 +75,40 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
   return paragraphs;
 }
 
+/** Extra request config per host — cookies, headers, etc. */
+function extraConfig(hostname: string): { headers?: Record<string, string>; params?: Record<string, string> } {
+  if (hostname === "archiveofourown.org") {
+    return {
+      headers: {
+        // AO3 requires this cookie to view adult/mature content without a login redirect
+        Cookie: "view_adult=true",
+      },
+    };
+  }
+  return {};
+}
+
+/** Build a human-readable title for AO3 chapters (Work title + Chapter title). */
+function buildAo3Title($: cheerio.CheerioAPI): string {
+  const workTitle    = cleanText($("h2.title.heading").first().text());
+  const chapterTitle = cleanText($(".chapter .title").first().text().replace(/^Chapter\s+\d+[:.]?\s*/i, ""));
+  if (workTitle && chapterTitle) return `${workTitle} — ${chapterTitle}`;
+  if (workTitle) return workTitle;
+  return "Chapter";
+}
+
 export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
+  const hostname = new URL(url).hostname.replace("www.", "");
+  const extra    = extraConfig(hostname);
+
   const { data: html } = await axios.get(url, {
     headers: {
+      // Realistic browser UA — some sites (AO3) block simple bot UAs
       "User-Agent":
-        "Mozilla/5.0 (compatible; DiscordBot/1.0)",
-      "Accept": "text/html,application/xhtml+xml",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+      ...extra.headers,
     },
     timeout: 15000,
   });
@@ -83,19 +116,28 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   const $ = cheerio.load(html);
 
   // Remove noise
-  $("script, style, nav, header, footer, aside, noscript, .sharedaddy, .jp-relatedposts, .comments-area, #comments").remove();
+  $(
+    "script, style, nav, header, footer, aside, noscript, " +
+    ".sharedaddy, .jp-relatedposts, .comments-area, #comments, " +
+    // AO3-specific noise
+    "#header, #footer, #main > .wrapper > .message, " +
+    ".kudos, .bookmarks, .hits, #kudos, .comment_count"
+  ).remove();
 
-  const hostname = new URL(url).hostname.replace("www.", "");
   const siteSelectors = SELECTORS_BY_HOST[hostname];
 
   // Find title
   let title = "";
-  const titleSelectors = siteSelectors?.title ?? GENERIC_TITLE_SELECTORS;
-  for (const sel of titleSelectors) {
-    const el = $(sel).first();
-    if (el.length && el.text().trim()) {
-      title = cleanText(el.text());
-      break;
+  if (hostname === "archiveofourown.org") {
+    title = buildAo3Title($);
+  } else {
+    const titleSelectors = siteSelectors?.title ?? GENERIC_TITLE_SELECTORS;
+    for (const sel of titleSelectors) {
+      const el = $(sel).first();
+      if (el.length && el.text().trim()) {
+        title = cleanText(el.text());
+        break;
+      }
     }
   }
   if (!title) title = $("title").text().split("|")[0]?.trim() ?? "Chapter";
@@ -117,7 +159,8 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
 
   if (paragraphs.length === 0) {
     throw new Error(
-      "Could not extract readable content from that page. Make sure it's a public chapter URL."
+      "Could not extract readable content from that page. " +
+      "Make sure it's a public chapter URL (AO3, WCT, or similar)."
     );
   }
 

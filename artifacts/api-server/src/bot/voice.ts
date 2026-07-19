@@ -15,17 +15,20 @@ import { VoiceBasedChannel, TextBasedChannel, Guild, Message as DjsMessage } fro
 import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
+import { saveBookmark, clearBookmark } from "./bookmarks.js";
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
 export interface ReadSession {
   guildId: string;
   title: string;
+  url: string;
   allChunks: string[];
   chunkIndex: number;
   paused: boolean;
   stopped: boolean;
   voiceVersion: number;
+  consecutiveSkips: number;
   player: AudioPlayer;
   textChannel: TextBasedChannel;
   /** The live progress bar message — edited in place as reading advances */
@@ -54,6 +57,7 @@ export function setGuildVoice(guildId: string, voice: VoiceOption): void {
   const session = sessions.get(guildId);
   if (session) {
     session.voiceVersion++;
+    session.consecutiveSkips = 0; // reset failure counter on explicit voice change
     session.player.stop();
   }
   warmUpVoice(voice);
@@ -66,11 +70,21 @@ export function getSession(guildId: string): ReadSession | undefined {
   return sessions.get(guildId);
 }
 
-export function stopSession(guildId: string): void {
+export async function stopSession(guildId: string): Promise<void> {
   const session = sessions.get(guildId);
   if (session) {
     session.stopped = true;
     session.player.stop(true);
+    // Save bookmark so the user can resume later
+    if (session.chunkIndex > 0 && session.chunkIndex < session.allChunks.length) {
+      await saveBookmark(
+        guildId,
+        session.url,
+        session.chunkIndex,
+        session.allChunks.length,
+        session.title,
+      ).catch(() => {});
+    }
   }
   sessions.delete(guildId);
   getVoiceConnection(guildId)?.destroy();
@@ -81,9 +95,11 @@ export async function startReading(
   voiceChannel: VoiceBasedChannel,
   textChannel: TextBasedChannel,
   title: string,
-  paragraphs: string[]
+  paragraphs: string[],
+  url: string,
+  resumeFromChunk = 0,
 ): Promise<void> {
-  stopSession(guild.id);
+  await stopSession(guild.id);
 
   const allChunks: string[] = [];
   for (const para of paragraphs) allChunks.push(...splitIntoChunks(para));
@@ -97,18 +113,20 @@ export async function startReading(
   let progressMsg: DjsMessage | null = null;
   try {
     progressMsg = await (textChannel as { send(c: string): Promise<DjsMessage> }).send(
-      progressBar(title, 0, allChunks.length, voice, true)
+      progressBar(title, resumeFromChunk, allChunks.length, voice, true)
     );
   } catch { /* non-fatal */ }
 
   const session: ReadSession = {
     guildId: guild.id,
     title,
+    url,
     allChunks,
-    chunkIndex: 0,
+    chunkIndex: resumeFromChunk,
     paused: false,
     stopped: false,
     voiceVersion: 0,
+    consecutiveSkips: 0,
     player,
     textChannel,
     progressMsg,
@@ -126,7 +144,7 @@ export async function startReading(
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
   } catch {
-    stopSession(guild.id);
+    await stopSession(guild.id);
     throw new Error("Could not connect to the voice channel within 15 seconds.");
   }
 
@@ -205,7 +223,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
 
 async function runPipeline(session: ReadSession, connection: VoiceConnection): Promise<void> {
   let next = await generateChunk(session);
-  // Update bar from "loading" to 0% now that first chunk is ready
+  // Update bar from "loading" to actual progress now that first chunk is ready
   await updateProgress(session);
 
   while (next !== null && !session.stopped) {
@@ -251,27 +269,48 @@ async function runPipeline(session: ReadSession, connection: VoiceConnection): P
   await finalizeProgress(session, session.stopped);
 
   if (!session.stopped) {
+    // Natural completion — clear any saved bookmark for this chapter
+    await clearBookmark(session.guildId).catch(() => {});
     stopSession(session.guildId);
   }
 }
 
 // ─── Chunk generation ────────────────────────────────────────────────────────
 
+const FALLBACK_THRESHOLD = 3; // consecutive failures before auto-switching to Jenny
+
 async function generateChunk(session: ReadSession): Promise<ChunkResult | null> {
   while (session.chunkIndex < session.allChunks.length) {
     if (session.stopped) return null;
 
-    const chunkIdx       = session.chunkIndex++;
-    const text           = session.allChunks[chunkIdx]!;
+    const chunkIdx        = session.chunkIndex++;
+    const text            = session.allChunks[chunkIdx]!;
     const capturedVersion = session.voiceVersion;
-    const voice          = getGuildVoice(session.guildId);
+    const voice           = getGuildVoice(session.guildId);
 
     try {
       const file = await textToMp3File(text, voice);
+      session.consecutiveSkips = 0; // reset on success
       return { file, chunkIdx, voiceVersion: capturedVersion };
     } catch (err) {
-      // All 3 retries failed — skip silently and move on
       console.error(`[generateChunk] skip chunk ${chunkIdx}: ${(err as Error).message}`);
+      session.consecutiveSkips++;
+
+      // After N consecutive failures on a non-Jenny voice, auto-fall back to Jenny
+      // so reading continues rather than the session terminating silently.
+      if (
+        session.consecutiveSkips >= FALLBACK_THRESHOLD &&
+        voice.id !== DEFAULT_VOICE.id
+      ) {
+        console.warn(`[generateChunk] ${voice.label} unavailable — falling back to Jenny`);
+        // setGuildVoice bumps voiceVersion (triggers pipeline regen) and resets counter
+        setGuildVoice(session.guildId, DEFAULT_VOICE);
+        try {
+          await (session.textChannel as { send(c: string): Promise<DjsMessage> }).send(
+            `⚠️ Voice **${voice.label}** isn't available right now — switching to **Jenny** to continue reading.`
+          );
+        } catch { /* ignore */ }
+      }
     }
   }
   return null;
