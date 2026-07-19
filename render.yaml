@@ -4,7 +4,7 @@ services:
     runtime: node
     region: oregon
     plan: free
-    buildCommand: npm install -g pnpm && pnpm install --frozen-lockfile
+    buildCommand: npm install -g pnpm@9 && pnpm install
     startCommand: pnpm --filter @workspace/api-server run bot
     envVars:
       - key: NODE_VERSION
