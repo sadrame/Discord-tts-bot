@@ -6,6 +6,7 @@ import {
   GuildMember,
   TextChannel,
   ChatInputCommandInteraction,
+  ButtonInteraction,
   Interaction,
   REST,
   Routes,
@@ -24,6 +25,8 @@ import {
   pauseSession,
   resumeSession,
   skipParagraph,
+  seekSession,
+  restartSession,
   getSession,
   getProgressInfo,
   getGuildVoice,
@@ -55,9 +58,13 @@ function helpText(): string {
     "`/pause` — pause playback",
     "`/resume` — resume playback",
     "`/skip` — skip current paragraph",
+    "`/restart` — restart the chapter from the beginning",
+    "`/seek <0–100>` — jump to a % position in the chapter",
     "`/progress` — show a progress bar",
     "`/voice` — pick a TTS voice from a dropdown",
     "`/help` — show this message",
+    "",
+    "The progress bar also has ⏮️ ⏪ ⏩ buttons for quick navigation.",
     "",
     "All commands also work with the `!` prefix.",
     "Supports WitchCultTranslations and AO3 links.",
@@ -246,6 +253,22 @@ function handleProgress(guildId: string): string {
   );
 }
 
+function handleRestart(guildId: string): string {
+  const session = getSession(guildId);
+  if (!session) return "❌ Nothing is currently playing.";
+  const title = session.title;
+  restartSession(guildId);
+  return `⏮️ Restarting **${title}** from the beginning...`;
+}
+
+function handleSeek(guildId: string, percent: number): string {
+  const session = getSession(guildId);
+  if (!session) return "❌ Nothing is currently playing.";
+  const target = Math.floor((percent / 100) * session.allChunks.length);
+  seekSession(guildId, target);
+  return `⏩ Jumping to **${percent}%** of *${session.title}*...`;
+}
+
 // ─── Discord client ───────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -277,6 +300,26 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
+
+  // ── Seek/restart control buttons on the progress bar ───────────────────────
+  if (interaction.isButton()) {
+    const btn = interaction as ButtonInteraction;
+    const { customId } = btn;
+    if (customId === "ctrl_restart" || customId === "ctrl_back" || customId === "ctrl_forward") {
+      await btn.deferUpdate().catch(() => {});
+      const session = getSession(guildId);
+      if (!session) return; // session ended — silently ignore
+      if (customId === "ctrl_restart") {
+        restartSession(guildId);
+      } else {
+        const step = Math.max(1, Math.round(session.allChunks.length * 0.15));
+        seekSession(guildId, customId === "ctrl_back"
+          ? session.chunkIndex - step
+          : session.chunkIndex + step);
+      }
+      return;
+    }
+  }
 
   // ── Voice select menu result ────────────────────────────────────────────────
   if (interaction.isStringSelectMenu() && interaction.customId === "voice_select") {
@@ -323,6 +366,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "pause":    await editReply(handlePause(guildId));      break;
       case "resume":   await editReply(handleResume(guildId));     break;
       case "skip":     await editReply(handleSkip(guildId));       break;
+      case "restart":  await editReply(handleRestart(guildId));    break;
+      case "seek": {
+        const pct = cmd.options.getInteger("percent", true);
+        await editReply(handleSeek(guildId, pct));
+        break;
+      }
       case "progress": await editReply(handleProgress(guildId));   break;
       case "help":     await editReply(helpText());                break;
 
@@ -387,6 +436,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
       case "pause":    reply = handlePause(guildId);      break;
       case "resume":   reply = handleResume(guildId);     break;
       case "skip":     reply = handleSkip(guildId);       break;
+      case "restart":  reply = handleRestart(guildId);    break;
+      case "seek": {
+        const pct = parseInt(args[0] ?? "", 10);
+        reply = isNaN(pct) ? "❌ Usage: `!seek <0–100>`" : handleSeek(guildId, Math.max(0, Math.min(100, pct)));
+        break;
+      }
       case "progress": reply = handleProgress(guildId);   break;
       case "help":     reply = helpText();                break;
       default: return;

@@ -40,6 +40,17 @@ export const slashCommands = [
     .setDescription("Pick a TTS voice from a dropdown menu"),
 
   new SlashCommandBuilder()
+    .setName("restart")
+    .setDescription("Restart the current chapter from the beginning"),
+
+  new SlashCommandBuilder()
+    .setName("seek")
+    .setDescription("Jump to a position in the current chapter (0–100%)")
+    .addIntegerOption((o) =>
+      o.setName("percent").setDescription("Position to jump to (0–100)").setRequired(true).setMinValue(0).setMaxValue(100)
+    ),
+
+  new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show all bot commands"),
 ].map((cmd) => cmd.toJSON());

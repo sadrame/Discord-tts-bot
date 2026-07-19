@@ -11,7 +11,7 @@ import {
   AudioPlayerStatus,
   VoiceConnection,
 } from "@discordjs/voice";
-import { VoiceBasedChannel, TextBasedChannel, Guild, Message as DjsMessage } from "discord.js";
+import { VoiceBasedChannel, TextBasedChannel, Guild, Message as DjsMessage, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import { textToMp3File, cleanupFile, splitIntoChunks, warmUpVoice } from "./tts.js";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
@@ -112,8 +112,8 @@ export async function startReading(
   const voice = getGuildVoice(guild.id);
   let progressMsg: DjsMessage | null = null;
   try {
-    progressMsg = await (textChannel as { send(c: string): Promise<DjsMessage> }).send(
-      progressBar(title, resumeFromChunk, allChunks.length, voice, true)
+    progressMsg = await (textChannel as any).send(
+      progressPayload(title, resumeFromChunk, allChunks.length, voice, true)
     );
   } catch { /* non-fatal */ }
 
@@ -187,6 +187,28 @@ function progressBar(
   );
 }
 
+function buildControlRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("ctrl_restart").setEmoji("⏮️").setStyle(ButtonStyle.Secondary).setLabel("Restart"),
+    new ButtonBuilder().setCustomId("ctrl_back").setEmoji("⏪").setStyle(ButtonStyle.Secondary).setLabel("-15%"),
+    new ButtonBuilder().setCustomId("ctrl_forward").setEmoji("⏩").setStyle(ButtonStyle.Secondary).setLabel("+15%"),
+  );
+}
+
+type ProgressPayload = { content: string; components: ActionRowBuilder<ButtonBuilder>[] };
+
+function progressPayload(
+  title: string,
+  done: number,
+  total: number,
+  voice: VoiceOption,
+  loading = false,
+): ProgressPayload {
+  const content = progressBar(title, done, total, voice, loading);
+  const finished = done >= total;
+  return { content, components: loading || finished ? [] : [buildControlRow()] };
+}
+
 async function updateProgress(session: ReadSession): Promise<void> {
   if (!session.progressMsg) return;
   const now = Date.now();
@@ -194,27 +216,22 @@ async function updateProgress(session: ReadSession): Promise<void> {
   session.lastProgressEdit = now;
 
   const voice = getGuildVoice(session.guildId);
-  const content = progressBar(
-    session.title,
-    session.chunkIndex,
-    session.allChunks.length,
-    voice,
-  );
+  const payload = progressPayload(session.title, session.chunkIndex, session.allChunks.length, voice);
   try {
-    await session.progressMsg.edit(content);
+    await session.progressMsg.edit(payload);
   } catch { /* ignore — message might be deleted */ }
 }
 
 async function finalizeProgress(session: ReadSession, stopped = false): Promise<void> {
   if (!session.progressMsg) return;
   if (stopped) {
-    try { await session.progressMsg.edit(`⏹️ **${session.title}** — stopped.`); } catch { /* ignore */ }
+    try { await session.progressMsg.edit({ content: `⏹️ **${session.title}** — stopped.`, components: [] }); } catch { /* ignore */ }
     return;
   }
   const voice = getGuildVoice(session.guildId);
   try {
     await session.progressMsg.edit(
-      progressBar(session.title, session.allChunks.length, session.allChunks.length, voice)
+      progressPayload(session.title, session.allChunks.length, session.allChunks.length, voice)
     );
   } catch { /* ignore */ }
 }
@@ -257,9 +274,9 @@ async function runPipeline(session: ReadSession, connection: VoiceConnection): P
     const preGen = await nextPromise;
 
     if (preGen && session.voiceVersion !== versionAtKickoff) {
-      // Voice changed while playing — discard stale chunk and re-generate
+      // Voice changed or seek happened — discard stale pre-generated chunk and
+      // re-generate from the current chunkIndex (seek may have moved it)
       await cleanupFile(preGen.file);
-      session.chunkIndex = preGen.chunkIdx;
       next = await generateChunk(session);
     } else {
       next = preGen;
@@ -346,6 +363,20 @@ export function getProgressInfo(guildId: string): { index: number; total: number
   const session = sessions.get(guildId);
   if (!session) return null;
   return { index: session.chunkIndex, total: session.allChunks.length, title: session.title, paused: session.paused };
+}
+
+export function seekSession(guildId: string, chunkIndex: number): boolean {
+  const session = sessions.get(guildId);
+  if (!session) return false;
+  session.chunkIndex = Math.max(0, Math.min(chunkIndex, session.allChunks.length - 1));
+  session.voiceVersion++;   // discard any in-flight pre-generated audio
+  session.consecutiveSkips = 0;
+  session.player.stop();    // kick the pipeline to regenerate from new position
+  return true;
+}
+
+export function restartSession(guildId: string): boolean {
+  return seekSession(guildId, 0);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
