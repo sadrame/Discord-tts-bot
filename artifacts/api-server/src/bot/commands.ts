@@ -45,9 +45,9 @@ export const slashCommands = [
 
   new SlashCommandBuilder()
     .setName("seek")
-    .setDescription("Jump to a position in the current chapter (0–100%)")
+    .setDescription("Jump to a position in the current chapter by seconds (e.g. 120 = 2:00)")
     .addIntegerOption((o) =>
-      o.setName("percent").setDescription("Position to jump to (0–100)").setRequired(true).setMinValue(0).setMaxValue(100)
+      o.setName("seconds").setDescription("Timestamp to jump to in seconds (e.g. 90 = 1:30)").setRequired(true).setMinValue(0)
     ),
 
   new SlashCommandBuilder()

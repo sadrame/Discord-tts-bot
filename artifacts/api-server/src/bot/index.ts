@@ -25,10 +25,12 @@ import {
   pauseSession,
   resumeSession,
   skipParagraph,
-  seekSession,
+  seekSessionBySeconds,
+  seekRelativeSeconds,
   restartSession,
   getSession,
   getProgressInfo,
+  getProgressSeconds,
   getGuildVoice,
   setGuildVoice,
 } from "./voice.js";
@@ -59,12 +61,12 @@ function helpText(): string {
     "`/resume` — resume playback",
     "`/skip` — skip current paragraph",
     "`/restart` — restart the chapter from the beginning",
-    "`/seek <0–100>` — jump to a % position in the chapter",
+    "`/seek <seconds>` — jump to a timestamp (e.g. `/seek 120` = 2:00)",
     "`/progress` — show a progress bar",
     "`/voice` — pick a TTS voice from a dropdown",
     "`/help` — show this message",
     "",
-    "The progress bar also has ⏮️ ⏪ ⏩ buttons for quick navigation.",
+    "The progress bar has ⏮️ ⏪-30s ⏸️ ⏩+30s ⏹️ buttons for live control.",
     "",
     "All commands also work with the `!` prefix.",
     "Supports WitchCultTranslations and AO3 links.",
@@ -261,12 +263,18 @@ function handleRestart(guildId: string): string {
   return `⏮️ Restarting **${title}** from the beginning...`;
 }
 
-function handleSeek(guildId: string, percent: number): string {
-  const session = getSession(guildId);
-  if (!session) return "❌ Nothing is currently playing.";
-  const target = Math.floor((percent / 100) * session.allChunks.length);
-  seekSession(guildId, target);
-  return `⏩ Jumping to **${percent}%** of *${session.title}*...`;
+function handleSeek(guildId: string, seconds: number): string {
+  const info = getProgressSeconds(guildId);
+  if (!info) return "❌ Nothing is currently playing.";
+  if (seconds > info.totalSec) return `❌ Chapter is only **${fmt(info.totalSec)}** long.`;
+  seekSessionBySeconds(guildId, seconds);
+  return `⏩ Jumping to **${fmt(seconds)}** of *${info.title}* (~${fmt(info.totalSec)} total)...`;
+}
+
+function fmt(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 // ─── Discord client ───────────────────────────────────────────────────────────
@@ -301,21 +309,22 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (!interaction.guild) return;
   const guildId = interaction.guild.id;
 
-  // ── Seek/restart control buttons on the progress bar ───────────────────────
+  // ── Seek/restart/pause/stop control buttons on the progress bar ────────────
   if (interaction.isButton()) {
     const btn = interaction as ButtonInteraction;
     const { customId } = btn;
-    if (customId === "ctrl_restart" || customId === "ctrl_back" || customId === "ctrl_forward") {
+    if (["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop"].includes(customId)) {
       await btn.deferUpdate().catch(() => {});
-      const session = getSession(guildId);
-      if (!session) return; // session ended — silently ignore
-      if (customId === "ctrl_restart") {
-        restartSession(guildId);
-      } else {
-        const step = Math.max(1, Math.round(session.allChunks.length * 0.15));
-        seekSession(guildId, customId === "ctrl_back"
-          ? session.chunkIndex - step
-          : session.chunkIndex + step);
+      switch (customId) {
+        case "ctrl_restart": restartSession(guildId); break;
+        case "ctrl_back":    seekRelativeSeconds(guildId, -30); break;
+        case "ctrl_forward": seekRelativeSeconds(guildId, +30); break;
+        case "ctrl_pause": {
+          const s = getSession(guildId);
+          if (s?.paused) resumeSession(guildId); else pauseSession(guildId);
+          break;
+        }
+        case "ctrl_stop": await stopSession(guildId); break;
       }
       return;
     }
@@ -368,8 +377,8 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "skip":     await editReply(handleSkip(guildId));       break;
       case "restart":  await editReply(handleRestart(guildId));    break;
       case "seek": {
-        const pct = cmd.options.getInteger("percent", true);
-        await editReply(handleSeek(guildId, pct));
+        const secs = cmd.options.getInteger("seconds", true);
+        await editReply(handleSeek(guildId, secs));
         break;
       }
       case "progress": await editReply(handleProgress(guildId));   break;
@@ -438,8 +447,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
       case "skip":     reply = handleSkip(guildId);       break;
       case "restart":  reply = handleRestart(guildId);    break;
       case "seek": {
-        const pct = parseInt(args[0] ?? "", 10);
-        reply = isNaN(pct) ? "❌ Usage: `!seek <0–100>`" : handleSeek(guildId, Math.max(0, Math.min(100, pct)));
+        const secs = parseInt(args[0] ?? "", 10);
+        reply = isNaN(secs) || secs < 0 ? "❌ Usage: `!seek <seconds>` (e.g. `!seek 120` = 2:00)" : handleSeek(guildId, secs);
         break;
       }
       case "progress": reply = handleProgress(guildId);   break;

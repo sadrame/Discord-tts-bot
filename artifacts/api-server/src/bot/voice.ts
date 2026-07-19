@@ -113,7 +113,7 @@ export async function startReading(
   let progressMsg: DjsMessage | null = null;
   try {
     progressMsg = await (textChannel as any).send(
-      progressPayload(title, resumeFromChunk, allChunks.length, voice, true)
+      progressPayload(title, allChunks, resumeFromChunk, voice, false, true)
     );
   } catch { /* non-fatal */ }
 
@@ -156,17 +156,50 @@ export async function startReading(
   );
 }
 
+// ─── Time estimation (word-count based, ~150 wpm TTS) ────────────────────────
+
+const WORDS_PER_SEC = 2.5;
+
+function chunkSeconds(chunk: string): number {
+  return Math.max(0.3, chunk.trim().split(/\s+/).length / WORDS_PER_SEC);
+}
+
+function totalChapterSeconds(chunks: string[]): number {
+  return chunks.reduce((s, c) => s + chunkSeconds(c), 0);
+}
+
+function currentChapterSeconds(chunks: string[], upTo: number): number {
+  return chunks.slice(0, upTo).reduce((s, c) => s + chunkSeconds(c), 0);
+}
+
+function chunkIndexAtSecond(chunks: string[], targetSec: number): number {
+  let elapsed = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    elapsed += chunkSeconds(chunks[i]!);
+    if (elapsed >= targetSec) return i;
+  }
+  return Math.max(0, chunks.length - 1);
+}
+
+function fmt(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 // ─── Progress bar ─────────────────────────────────────────────────────────────
 
 function progressBar(
   title: string,
+  currentSec: number,
+  totalSec: number,
   done: number,
   total: number,
   voice: VoiceOption,
   loading = false,
 ): string {
   const WIDTH = 20;
-  const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+  const pct    = total > 0 ? Math.round((done / total) * 100) : 0;
   const filled = Math.round((pct / 100) * WIDTH);
   const bar    = "▓".repeat(filled) + "░".repeat(WIDTH - filled);
   const flag   = ({ American: "🇺🇸", British: "🇬🇧", Australian: "🇦🇺", Irish: "🇮🇪" } as Record<string, string>)[voice.accent] ?? "🌐";
@@ -181,17 +214,23 @@ function progressBar(
 
   return (
     `📖 **${title}**\n` +
-    `${bar} **${pct}%** · ${done}/${total} chunks\n` +
+    `${bar} **${fmt(currentSec)}** / ${fmt(totalSec)}\n` +
     `🎙️ ${flag} **${voice.label}**` +
-    (pct === 100 ? " · ✅ Done!" : "")
+    (done >= total ? " · ✅ Done!" : "")
   );
 }
 
-function buildControlRow(): ActionRowBuilder<ButtonBuilder> {
+function buildControlRow(paused: boolean): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ctrl_restart").setEmoji("⏮️").setStyle(ButtonStyle.Secondary).setLabel("Restart"),
-    new ButtonBuilder().setCustomId("ctrl_back").setEmoji("⏪").setStyle(ButtonStyle.Secondary).setLabel("-15%"),
-    new ButtonBuilder().setCustomId("ctrl_forward").setEmoji("⏩").setStyle(ButtonStyle.Secondary).setLabel("+15%"),
+    new ButtonBuilder().setCustomId("ctrl_restart").setEmoji("⏮️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ctrl_back").setEmoji("⏪").setLabel("-30s").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("ctrl_pause")
+      .setEmoji(paused ? "▶️" : "⏸️")
+      .setLabel(paused ? "Resume" : "Pause")
+      .setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ctrl_forward").setEmoji("⏩").setLabel("+30s").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ctrl_stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
   );
 }
 
@@ -199,14 +238,17 @@ type ProgressPayload = { content: string; components: ActionRowBuilder<ButtonBui
 
 function progressPayload(
   title: string,
-  done: number,
-  total: number,
+  allChunks: string[],
+  chunkIndex: number,
   voice: VoiceOption,
+  paused: boolean,
   loading = false,
 ): ProgressPayload {
-  const content = progressBar(title, done, total, voice, loading);
-  const finished = done >= total;
-  return { content, components: loading || finished ? [] : [buildControlRow()] };
+  const currentSec = loading ? 0 : currentChapterSeconds(allChunks, chunkIndex);
+  const totalSec   = totalChapterSeconds(allChunks);
+  const content    = progressBar(title, currentSec, totalSec, chunkIndex, allChunks.length, voice, loading);
+  const finished   = chunkIndex >= allChunks.length;
+  return { content, components: loading || finished ? [] : [buildControlRow(paused)] };
 }
 
 async function updateProgress(session: ReadSession): Promise<void> {
@@ -216,7 +258,7 @@ async function updateProgress(session: ReadSession): Promise<void> {
   session.lastProgressEdit = now;
 
   const voice = getGuildVoice(session.guildId);
-  const payload = progressPayload(session.title, session.chunkIndex, session.allChunks.length, voice);
+  const payload = progressPayload(session.title, session.allChunks, session.chunkIndex, voice, session.paused);
   try {
     await session.progressMsg.edit(payload);
   } catch { /* ignore — message might be deleted */ }
@@ -231,7 +273,7 @@ async function finalizeProgress(session: ReadSession, stopped = false): Promise<
   const voice = getGuildVoice(session.guildId);
   try {
     await session.progressMsg.edit(
-      progressPayload(session.title, session.allChunks.length, session.allChunks.length, voice)
+      progressPayload(session.title, session.allChunks, session.allChunks.length, voice, false)
     );
   } catch { /* ignore */ }
 }
@@ -375,8 +417,32 @@ export function seekSession(guildId: string, chunkIndex: number): boolean {
   return true;
 }
 
+export function seekSessionBySeconds(guildId: string, targetSec: number): boolean {
+  const session = sessions.get(guildId);
+  if (!session) return false;
+  const idx = chunkIndexAtSecond(session.allChunks, Math.max(0, targetSec));
+  return seekSession(guildId, idx);
+}
+
+export function seekRelativeSeconds(guildId: string, deltaSec: number): boolean {
+  const session = sessions.get(guildId);
+  if (!session) return false;
+  const current = currentChapterSeconds(session.allChunks, session.chunkIndex);
+  return seekSessionBySeconds(guildId, current + deltaSec);
+}
+
 export function restartSession(guildId: string): boolean {
   return seekSession(guildId, 0);
+}
+
+export function getProgressSeconds(guildId: string): { currentSec: number; totalSec: number; title: string } | null {
+  const session = sessions.get(guildId);
+  if (!session) return null;
+  return {
+    currentSec: currentChapterSeconds(session.allChunks, session.chunkIndex),
+    totalSec:   totalChapterSeconds(session.allChunks),
+    title:      session.title,
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
