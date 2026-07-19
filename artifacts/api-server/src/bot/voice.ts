@@ -222,15 +222,15 @@ function progressBar(
 
 function buildControlRow(paused: boolean): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ctrl_restart").setEmoji("⏮️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ctrl_restart").setEmoji("⏮️").setLabel("Restart").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("ctrl_back").setEmoji("⏪").setLabel("-30s").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("ctrl_pause")
       .setEmoji(paused ? "▶️" : "⏸️")
       .setLabel(paused ? "Resume" : "Pause")
-      .setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+      .setStyle(paused ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("ctrl_forward").setEmoji("⏩").setLabel("+30s").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("ctrl_stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("ctrl_stop").setEmoji("⏹️").setLabel("Stop").setStyle(ButtonStyle.Danger),
   );
 }
 
@@ -262,6 +262,15 @@ async function updateProgress(session: ReadSession): Promise<void> {
   try {
     await session.progressMsg.edit(payload);
   } catch { /* ignore — message might be deleted */ }
+}
+
+/** Force an immediate progress bar refresh — bypasses the 4-second rate limit.
+ *  Use after button interactions so the UI reflects the new state right away. */
+export async function forceProgressUpdate(guildId: string): Promise<void> {
+  const session = sessions.get(guildId);
+  if (!session?.progressMsg) return;
+  session.lastProgressEdit = 0; // clear rate-limit so updateProgress runs
+  await updateProgress(session);
 }
 
 async function finalizeProgress(session: ReadSession, stopped = false): Promise<void> {

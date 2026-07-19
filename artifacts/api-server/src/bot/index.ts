@@ -28,6 +28,7 @@ import {
   seekSessionBySeconds,
   seekRelativeSeconds,
   restartSession,
+  forceProgressUpdate,
   getSession,
   getProgressInfo,
   getProgressSeconds,
@@ -326,6 +327,8 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         }
         case "ctrl_stop": await stopSession(guildId); break;
       }
+      // Immediately refresh the progress bar so the button states update at once
+      await forceProgressUpdate(guildId).catch(() => {});
       return;
     }
   }
