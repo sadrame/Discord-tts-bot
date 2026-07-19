@@ -3,10 +3,11 @@
  * Saved to disk so progress survives bot restarts.
  */
 import { readFile, writeFile, mkdir } from "fs/promises";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 
-const DATA_DIR  = join(dirname(fileURLToPath(import.meta.url)), "../../data");
+// process.cwd() is the working directory of the bot process — writable on
+// Render, Railway, Fly.io, and local dev. Falls back to /tmp if that fails.
+const DATA_DIR  = join(process.cwd(), "data");
 const DATA_FILE = join(DATA_DIR, "bookmarks.json");
 
 interface Bookmark {

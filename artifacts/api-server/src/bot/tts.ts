@@ -6,7 +6,7 @@ import { randomUUID } from "crypto";
 import type { VoiceOption } from "./voices.js";
 import { DEFAULT_VOICE } from "./voices.js";
 
-const TIMEOUT_MS = 25_000;
+const TIMEOUT_MS = 30_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -19,30 +19,54 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
-// ─── Persistent engine cache ──────────────────────────────────────────────────
-// Re-using the same MsEdgeTTS instance keeps the WebSocket alive across chunks,
-// avoiding the per-chunk reconnect that causes Microsoft to rate-limit us.
-// On any failure the entry is evicted so the next attempt gets a fresh socket.
-const engineCache = new Map<string, MsEdgeTTS>();
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-async function getEngine(voiceId: string): Promise<MsEdgeTTS> {
-  const cached = engineCache.get(voiceId);
-  if (cached) return cached;
+/**
+ * Build SSML with the specific voice embedded.
+ * Using rawToStream() with this SSML lets us use ANY voice on a SINGLE shared
+ * WebSocket — no reconnection needed when the voice changes.
+ */
+function buildSsml(text: string, voiceId: string): string {
+  // Infer locale from voice ID: "en-US-JennyNeural" → "en-US"
+  const locale = voiceId.match(/^([a-z]{2}-[A-Z]{2})/)?.[1] ?? "en-US";
+  return (
+    `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" ` +
+    `xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${locale}">` +
+    `<voice name="${voiceId}">${escapeXml(text)}</voice>` +
+    `</speak>`
+  );
+}
 
+// ─── Single shared WebSocket engine ──────────────────────────────────────────
+// ONE MsEdgeTTS instance for ALL voices.
+// Voice is specified per-request via SSML (<voice name="...">) using rawToStream().
+// This avoids the per-voice reconnect that causes Microsoft to block connections.
+let sharedEngine: MsEdgeTTS | null = null;
+
+async function getEngine(): Promise<MsEdgeTTS> {
+  if (sharedEngine) return sharedEngine;
   const engine = new MsEdgeTTS();
-  await engine.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-  engineCache.set(voiceId, engine);
-  console.log(`[tts] new WS connection for ${voiceId}`);
+  // Connect with Jenny — actual voice is overridden per-request in the SSML
+  await engine.setMetadata(DEFAULT_VOICE.id, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+  sharedEngine = engine;
+  console.log("[tts] WebSocket established (shared for all voices)");
   return engine;
 }
 
-function evictEngine(voiceId: string): void {
-  engineCache.delete(voiceId);
+function invalidateEngine(): void {
+  sharedEngine = null;
+  console.log("[tts] WebSocket invalidated — will reconnect on next request");
 }
 
 // ─── Global TTS semaphore ─────────────────────────────────────────────────────
-// Only ONE synthesis runs at a time. Acquired ONCE per textToMp3File call
-// (covering all retries) so retries never let another caller sneak in.
+// ONE synthesis at a time. Held for the entire textToMp3File call (all retries).
 let ttsInFlight = false;
 const ttsQueue: Array<() => void> = [];
 
@@ -59,11 +83,14 @@ function releaseTts(): void {
 // ─── Low-level synthesis ──────────────────────────────────────────────────────
 
 async function synthesize(text: string, voiceId: string, filePath: string): Promise<void> {
-  const engine = await getEngine(voiceId);
+  const engine = await getEngine();
+  const ssml   = buildSsml(text, voiceId);
 
   await Promise.race([
     new Promise<void>((resolve, reject) => {
-      const { audioStream } = engine.toStream(text);
+      // rawToStream sends our pre-built SSML directly — voice name is inside it,
+      // so any of the 20+ voices work without a new WebSocket connection.
+      const { audioStream } = engine.rawToStream(ssml);
       const chunks: Buffer[] = [];
       audioStream.on("data", (c: Buffer) => chunks.push(c));
       audioStream.on("end", async () => {
@@ -87,15 +114,13 @@ async function synthesize(text: string, voiceId: string, filePath: string): Prom
 /**
  * Convert text to an MP3 temp file.
  *
- * - Reuses a cached MsEdgeTTS instance (persistent WebSocket) per voice to
- *   avoid Microsoft rate-limiting from repeated connection handshakes.
- * - Evicts the cached instance on failure so the next retry gets a fresh socket.
- * - Holds the global semaphore for all retries so no other synthesis can
- *   interleave — concurrent WebSockets to Edge TTS cause "stream closed".
+ * Uses a single shared WebSocket (rawToStream + per-request SSML) so all
+ * voices work without reconnecting. Retries invalidate and reconnect on failure.
+ * The global semaphore ensures only one synthesis is in-flight at a time.
  */
 export async function textToMp3File(
   text: string,
-  voice: VoiceOption = DEFAULT_VOICE
+  voice: VoiceOption = DEFAULT_VOICE,
 ): Promise<string> {
   const clean = sanitizeText(text);
   if (!clean) throw new Error("Text is empty after sanitisation");
@@ -113,11 +138,11 @@ export async function textToMp3File(
       } catch (err) {
         lastErr = err as Error;
         await unlink(filePath).catch(() => {});
-        // Evict the cached engine — the WebSocket is likely dead or blacklisted.
-        // Next attempt (or next call) will open a fresh connection.
-        evictEngine(voice.id);
+        // Invalidate the shared engine — stale or rate-limited connection.
+        // Next attempt creates a fresh WebSocket.
+        invalidateEngine();
         console.warn(`[tts] attempt ${attempt}/3 failed (${voice.id}): ${lastErr.message}`);
-        if (attempt < 3) await sleep(1_500);
+        if (attempt < 3) await sleep(2_000);
       }
     }
 
@@ -149,5 +174,5 @@ export function splitIntoChunks(text: string, maxChars = 400): string[] {
 
 /** No-op — kept for import compatibility. */
 export function warmUpVoice(_voice: VoiceOption): void {
-  // Intentionally empty — concurrent connections break Edge TTS
+  // Intentionally empty
 }
