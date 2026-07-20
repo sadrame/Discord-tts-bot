@@ -140,12 +140,60 @@ function extraConfig(hostname: string): { headers?: Record<string, string>; para
   return {};
 }
 
-function buildAo3Title($: cheerio.CheerioAPI): string {
-  const workTitle    = cleanText($("h2.title.heading").first().text());
-  const chapterTitle = cleanText($(".chapter .title").first().text().replace(/^Chapter\s+\d+[:.]?\s*/i, ""));
-  if (workTitle && chapterTitle) return `${workTitle} — ${chapterTitle}`;
-  if (workTitle) return workTitle;
-  return "Chapter";
+/** Dedicated AO3 extractor. Walks each div.chapter in order, pulling the
+ *  h3.title from the chapter preface and the story text from .userstuff.module.
+ *  Notes, summaries, end-notes, and converter credits are never touched. */
+function extractAo3(
+  $: cheerio.CheerioAPI,
+  workTitle: string,
+): { title: string; paragraphs: string[]; sections: ChapterSection[] } {
+  const allParagraphs: string[] = [];
+  const sections: ChapterSection[] = [];
+
+  const chapterDivs = $("#chapters div.chapter[id^='chapter-']").toArray();
+
+  // Single-chapter page — AO3 individual chapter URL
+  // The chapter div exists but there's only one; still extract correctly.
+  for (const chDiv of chapterDivs) {
+    const chEl = $(chDiv);
+
+    // Chapter title: first h3.title inside the first .chapter.preface.group
+    // (not the end-notes preface that also lives inside the same chapter div)
+    const prefaceEl  = chEl.children(".chapter.preface.group").first();
+    const rawTitle   = cleanText(prefaceEl.find("h3.title").first().text());
+    const chTitle    = rawTitle || `Chapter ${sections.length + 1}`;
+
+    // Story content only — ignore everything outside .userstuff.module
+    const userstuff  = chEl.children(".userstuff.module, .userstuff[role='article']").first();
+    if (!userstuff.length) continue;
+
+    // Remove any stray notes/credits that snuck inside userstuff
+    userstuff.find(
+      ".notes, p:contains('AOYeet'), p:contains('converted for free')"
+    ).remove();
+
+    // Extract paragraphs (no hr-as-scene-break — AO3 uses hr as narrative breaks too,
+    // but we handle them as Part N scene breaks within each chapter)
+    const { paragraphs: chParas, sections: chSections } = extractParagraphs(
+      $, userstuff, { hrAsSceneBreak: true }
+    );
+    if (chParas.length === 0) continue;
+
+    // Record this chapter as a section boundary
+    const startParagraph = allParagraphs.length;
+    sections.push({ title: chTitle, startParagraph });
+
+    // Offset inner scene-break sections relative to the full paragraph array
+    for (const s of chSections) {
+      // Skip index-0 offsets — those duplicate the chapter boundary itself
+      if (s.startParagraph === 0) continue;
+      sections.push({ title: `${chTitle} — ${s.title}`, startParagraph: startParagraph + s.startParagraph });
+    }
+
+    allParagraphs.push(...chParas);
+  }
+
+  return { title: workTitle, paragraphs: allParagraphs, sections };
 }
 
 export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
@@ -172,35 +220,28 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
     ".kudos, .bookmarks, .hits, #kudos, .comment_count"
   ).remove();
 
-  // AO3: strip author notes, summaries, and other metadata sections.
-  // We keep the chapter title headings (h2/h3.title inside .chapter > header)
-  // so chapter detection still works — we only strip the *content* blocks.
+  // ── AO3: use dedicated per-chapter extractor ──────────────────────────────
   if (hostname === "archiveofourown.org") {
-    $(
-      // Notes blocks (beginning + end of chapter, and work-level)
-      ".notes.module, .end-notes, .beginning-notes, " +
-      // Summary blocks inside chapters and the work preface
-      ".chapter .summary, .preface .summary, " +
-      // Work-level afterword
-      ".afterword, " +
-      // Converter credit lines
-      "p:contains('AOYeet'), p:contains('converted for free')"
-    ).remove();
+    const workTitle = cleanText($("h2.title.heading").first().text())
+      || $("title").text().split("|")[0]?.trim()
+      || "Chapter";
+    const { title, paragraphs, sections } = extractAo3($, workTitle);
+    if (paragraphs.length === 0) {
+      throw new Error("Could not extract readable content from that AO3 page. Make sure it's a public chapter or full-work URL.");
+    }
+    return { title, content: paragraphs.join("\n\n"), url, paragraphs, sections };
   }
 
+  // ── Generic extraction for non-AO3 sites ─────────────────────────────────
   const siteSelectors = SELECTORS_BY_HOST[hostname];
 
   let title = "";
-  if (hostname === "archiveofourown.org") {
-    title = buildAo3Title($);
-  } else {
-    const titleSelectors = siteSelectors?.title ?? GENERIC_TITLE_SELECTORS;
-    for (const sel of titleSelectors) {
-      const el = $(sel).first();
-      if (el.length && el.text().trim()) {
-        title = cleanText(el.text());
-        break;
-      }
+  const titleSelectors = siteSelectors?.title ?? GENERIC_TITLE_SELECTORS;
+  for (const sel of titleSelectors) {
+    const el = $(sel).first();
+    if (el.length && el.text().trim()) {
+      title = cleanText(el.text());
+      break;
     }
   }
   if (!title) title = $("title").text().split("|")[0]?.trim() ?? "Chapter";
@@ -209,11 +250,10 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   let sections: ChapterSection[] = [];
   const contentSelectors = siteSelectors?.content ?? GENERIC_CONTENT_SELECTORS;
 
-  const isAo3 = hostname === "archiveofourown.org";
   for (const sel of contentSelectors) {
     const el = $(sel).first();
     if (el.length) {
-      const found = extractParagraphs($, el, { hrAsSceneBreak: !isAo3 });
+      const found = extractParagraphs($, el, { hrAsSceneBreak: true });
       if (found.paragraphs.length >= 3) {
         paragraphs = found.paragraphs;
         sections   = found.sections;
