@@ -64,7 +64,7 @@ function isSceneDivider(text: string): boolean {
 }
 
 // AO3 heading text that is structural metadata, not story content
-const AO3_META_HEADINGS = /^(notes?|summary|end notes?|beginning notes?|author.?s note|works inspired|chapter \d+)/i;
+const AO3_META_HEADINGS = /^(notes?|summary|end notes?|beginning notes?|author.?s note|works inspired)/i;
 
 interface ExtractResult {
   paragraphs: string[];
@@ -172,22 +172,20 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
     ".kudos, .bookmarks, .hits, #kudos, .comment_count"
   ).remove();
 
-  // AO3: strip all author notes, chapter summaries, prefaces, and
-  // afterwords before extracting — these are metadata, not story text.
+  // AO3: strip author notes, summaries, and other metadata sections.
+  // We keep the chapter title headings (h2/h3.title inside .chapter > header)
+  // so chapter detection still works — we only strip the *content* blocks.
   if (hostname === "archiveofourown.org") {
     $(
-      ".notes, .end-notes, .beginning-notes, " +
-      ".preface .notes, .preface .summary, " +
-      ".chapter .notes, .chapter .summary, " +
-      ".afterword, .preface.group, " +
-      "#chapters .chapter + .preface, " +         // next-chapter preface
-      ".chapter > .notes.module, " +
-      "blockquote.userstuff ~ .notes, " +
-      ".chapter > header .notes"
+      // Notes blocks (beginning + end of chapter, and work-level)
+      ".notes.module, .end-notes, .beginning-notes, " +
+      // Summary blocks inside chapters and the work preface
+      ".chapter .summary, .preface .summary, " +
+      // Work-level afterword
+      ".afterword, " +
+      // Converter credit lines
+      "p:contains('AOYeet'), p:contains('converted for free')"
     ).remove();
-
-    // Also remove the "AOYeet" / converter credit line that appears as a <p>
-    $("p:contains('AOYeet'), p:contains('converted for free')").remove();
   }
 
   const siteSelectors = SELECTORS_BY_HOST[hostname];
