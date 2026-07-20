@@ -215,6 +215,10 @@ export async function startReading(
   connection.subscribe(player);
   connection.on(VoiceConnectionStatus.Disconnected, () => stopSession(guild.id));
 
+  // Show the live embed with buttons immediately — don't wait for first TTS chunk
+  session.lastProgressEdit = 0;
+  await updateProgress(session).catch(() => {});
+
   runPipeline(session, connection).catch((err) =>
     console.error("[pipeline] uncaught:", err)
   );
@@ -485,35 +489,53 @@ async function runPipeline(session: ReadSession, connection: VoiceConnection): P
 
 // ─── Chunk generation ────────────────────────────────────────────────────────
 
-const FALLBACK_THRESHOLD = 3;
+const FALLBACK_THRESHOLD  = 3; // failures before switching to Jenny
+const MAX_CHUNK_ATTEMPTS  = 2; // attempts per chunk with the current voice before giving up on that chunk
 
 async function generateChunk(session: ReadSession): Promise<ChunkResult | null> {
   while (session.chunkIndex < session.allChunks.length) {
     if (session.stopped) return null;
 
-    const chunkIdx        = session.chunkIndex++;
-    const text            = session.allChunks[chunkIdx]!;
-    const capturedVersion = session.voiceVersion;
-    const voice           = getGuildVoice(session.guildId);
+    // Peek — do NOT advance until we have a successful file
+    const chunkIdx = session.chunkIndex;
+    const text     = session.allChunks[chunkIdx]!;
+    let localFails = 0;
 
-    try {
-      const file = await textToMp3File(text, voice);
-      session.consecutiveSkips = 0;
-      return { file, chunkIdx, voiceVersion: capturedVersion };
-    } catch (err) {
-      console.error(`[generateChunk] skip chunk ${chunkIdx}: ${(err as Error).message}`);
-      session.consecutiveSkips++;
+    while (localFails < MAX_CHUNK_ATTEMPTS) {
+      if (session.stopped) return null;
 
-      if (session.consecutiveSkips >= FALLBACK_THRESHOLD && voice.id !== DEFAULT_VOICE.id) {
-        console.warn(`[generateChunk] ${voice.label} unavailable — falling back to Jenny`);
-        setGuildVoice(session.guildId, DEFAULT_VOICE);
-        try {
-          await (session.textChannel as any).send(
-            `⚠️ Voice **${voice.label}** isn't available right now — switching to **Jenny** to continue reading.`
-          );
-        } catch { /* ignore */ }
+      const capturedVersion = session.voiceVersion;
+      const voice           = getGuildVoice(session.guildId);
+
+      try {
+        const file = await textToMp3File(text, voice);
+        session.chunkIndex++;          // advance only on success
+        session.consecutiveSkips = 0;
+        return { file, chunkIdx, voiceVersion: capturedVersion };
+      } catch (err) {
+        localFails++;
+        session.consecutiveSkips++;
+        console.error(`[generateChunk] chunk ${chunkIdx} attempt ${localFails} (${voice.label}): ${(err as Error).message}`);
+
+        // After FALLBACK_THRESHOLD consecutive failures across chunks, switch to Jenny
+        if (session.consecutiveSkips >= FALLBACK_THRESHOLD && voice.id !== DEFAULT_VOICE.id) {
+          console.warn(`[generateChunk] switching from ${voice.label} to Jenny — retrying chunk ${chunkIdx}`);
+          setGuildVoice(session.guildId, DEFAULT_VOICE);
+          session.consecutiveSkips = 0;
+          localFails = 0; // give Jenny fresh attempts on this chunk
+          try {
+            await (session.textChannel as any).send(
+              `⚠️ Voice **${voice.label}** isn't available right now — switching to **Jenny** to continue reading.`
+            );
+          } catch { /* ignore */ }
+        }
       }
     }
+
+    // Exhausted attempts on this chunk — skip it and move on
+    console.warn(`[generateChunk] skipping chunk ${chunkIdx} after ${MAX_CHUNK_ATTEMPTS} failed attempts`);
+    session.chunkIndex++;
+    session.consecutiveSkips = 0;
   }
   return null;
 }
