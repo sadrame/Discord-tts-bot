@@ -63,12 +63,19 @@ function isSceneDivider(text: string): boolean {
   return /^[-*~=✦◆·•]{3,}$/.test(text.replace(/\s/g, ""));
 }
 
+// AO3 heading text that is structural metadata, not story content
+const AO3_META_HEADINGS = /^(notes?|summary|end notes?|beginning notes?|author.?s note|works inspired|chapter \d+)/i;
+
 interface ExtractResult {
   paragraphs: string[];
   sections: ChapterSection[];
 }
 
-function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<cheerio.AnyNode>): ExtractResult {
+function extractParagraphs(
+  $: cheerio.CheerioAPI,
+  contentEl: cheerio.Cheerio<cheerio.AnyNode>,
+  opts: { hrAsSceneBreak: boolean } = { hrAsSceneBreak: true },
+): ExtractResult {
   const paragraphs: string[] = [];
   const sections: ChapterSection[] = [];
   let partCounter = 0;
@@ -77,9 +84,9 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
     const tag = (el as cheerio.Element).tagName?.toLowerCase() ?? "";
     if (SKIP_TAGS.has(tag)) return;
 
-    // Horizontal rule = unnamed scene break
+    // Horizontal rule — only treat as scene break on non-AO3 sites
     if (tag === "hr") {
-      if (paragraphs.length > 0) {
+      if (opts.hrAsSceneBreak && paragraphs.length > 0) {
         partCounter++;
         sections.push({ title: `Part ${partCounter}`, startParagraph: paragraphs.length });
       }
@@ -91,6 +98,8 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
 
     // Heading = named chapter/section boundary
     if (/^h[1-6]$/.test(tag) && text.length < 200) {
+      // Skip AO3 structural metadata headings
+      if (AO3_META_HEADINGS.test(text)) return;
       // Mark boundary at the current paragraph position
       sections.push({ title: text, startParagraph: paragraphs.length });
       // Also include heading as a spoken paragraph so TTS announces it
@@ -100,7 +109,7 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
 
     if (text.length < 2) return;
 
-    // Scene divider pattern
+    // Scene divider pattern (text-based, works everywhere)
     if (isSceneDivider(text)) {
       if (paragraphs.length > 0) {
         partCounter++;
@@ -163,6 +172,24 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
     ".kudos, .bookmarks, .hits, #kudos, .comment_count"
   ).remove();
 
+  // AO3: strip all author notes, chapter summaries, prefaces, and
+  // afterwords before extracting — these are metadata, not story text.
+  if (hostname === "archiveofourown.org") {
+    $(
+      ".notes, .end-notes, .beginning-notes, " +
+      ".preface .notes, .preface .summary, " +
+      ".chapter .notes, .chapter .summary, " +
+      ".afterword, .preface.group, " +
+      "#chapters .chapter + .preface, " +         // next-chapter preface
+      ".chapter > .notes.module, " +
+      "blockquote.userstuff ~ .notes, " +
+      ".chapter > header .notes"
+    ).remove();
+
+    // Also remove the "AOYeet" / converter credit line that appears as a <p>
+    $("p:contains('AOYeet'), p:contains('converted for free')").remove();
+  }
+
   const siteSelectors = SELECTORS_BY_HOST[hostname];
 
   let title = "";
@@ -184,10 +211,11 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   let sections: ChapterSection[] = [];
   const contentSelectors = siteSelectors?.content ?? GENERIC_CONTENT_SELECTORS;
 
+  const isAo3 = hostname === "archiveofourown.org";
   for (const sel of contentSelectors) {
     const el = $(sel).first();
     if (el.length) {
-      const found = extractParagraphs($, el);
+      const found = extractParagraphs($, el, { hrAsSceneBreak: !isAo3 });
       if (found.paragraphs.length >= 3) {
         paragraphs = found.paragraphs;
         sections   = found.sections;
