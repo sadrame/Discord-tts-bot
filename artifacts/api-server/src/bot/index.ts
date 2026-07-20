@@ -182,12 +182,22 @@ async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url
   try {
     const ch = await client.channels.fetch(channelId);
     if (!ch || !("send" in ch)) return;
-    const ts          = `<t:${Math.floor(Date.now() / 1000)}:F>`;
-    const serverLink  = `[${guild.name}](https://discord.com/channels/${guild.id}/${sourceChannel.id})`;
+    const ts         = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+    const serverLink = `[${guild.name}](https://discord.com/channels/${guild.id}/${sourceChannel.id})`;
+
+    // Try to find an existing permanent invite, or create one
+    let inviteLine = "";
+    try {
+      const existing = await sourceChannel.fetchInvites();
+      const permanent = existing.find((inv) => inv.maxAge === 0 && !inv.expiresAt);
+      const inviteUrl = permanent?.url ?? (await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" })).url;
+      inviteLine = `\n📨 **Invite:** ${inviteUrl}`;
+    } catch { /* non-fatal — bot may lack Manage Channels permission */ }
+
     await (ch as TextChannel).send(
       `📋 **Read request**\n` +
       `👤 **User:** ${user.tag} (${user.id})\n` +
-      `🏠 **Server:** ${serverLink}\n` +
+      `🏠 **Server:** ${serverLink}${inviteLine}\n` +
       `🔗 **URL:** ${url}\n` +
       `🕐 **Time:** ${ts}`
     );
