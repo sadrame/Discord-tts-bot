@@ -17,6 +17,7 @@ import {
   ChannelType,
   VoiceBasedChannel,
   Guild,
+  User,
 } from "discord.js";
 import { scrapeChapter } from "./scraper.js";
 import {
@@ -172,6 +173,25 @@ async function pickVoiceChannel(
   }
 }
 
+// ─── Admin read log ───────────────────────────────────────────────────────────
+
+async function logRead(user: User, guild: Guild, url: string): Promise<void> {
+  const channelId = process.env["DISCORD_LOG_CHANNEL_ID"];
+  if (!channelId) return;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    if (!ch || !("send" in ch)) return;
+    const ts = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+    await (ch as TextChannel).send(
+      `📋 **Read request**\n` +
+      `👤 **User:** ${user.tag} (${user.id})\n` +
+      `🏠 **Server:** ${guild.name} (${guild.id})\n` +
+      `🔗 **URL:** ${url}\n` +
+      `🕐 **Time:** ${ts}`
+    );
+  } catch { /* non-fatal — log channel may be unreachable */ }
+}
+
 // ─── Shared command logic ─────────────────────────────────────────────────────
 
 async function handleRead(
@@ -181,6 +201,7 @@ async function handleRead(
   memberVC: VoiceBasedChannel | null | undefined,
   explicitVC: VoiceBasedChannel | null | undefined,
   url: string,
+  requestedBy: User,
   replyFn: (payload: { content: string; components?: ActionRowBuilder<StringSelectMenuBuilder>[] }) => Promise<Message | void>
 ): Promise<void> {
   if (!url.startsWith("http")) { await replyFn({ content: "❌ Please provide a valid URL." }); return; }
@@ -202,6 +223,9 @@ async function handleRead(
   let chapter;
   try { chapter = await scrapeChapter(url); }
   catch (err) { await safeSend(textChannel, `❌ Could not read that page: ${(err as Error).message}`); return; }
+
+  // Log the request to the admin channel (fire-and-forget)
+  logRead(requestedBy, guild, url).catch(() => {});
 
   // ── Check for saved bookmark ─────────────────────────────────────────────
   let resumeFromChunk = 0;
@@ -407,7 +431,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "read": {
         const url        = cmd.options.getString("url", true);
         const explicitVC = (cmd.options.getChannel("channel") as VoiceBasedChannel | null) ?? null;
-        await handleRead(guildId, interaction.guild, textChannel, memberVC, explicitVC, url,
+        await handleRead(guildId, interaction.guild, textChannel, memberVC, explicitVC, url, interaction.user,
           (p) => p.components?.length
             ? cmd.editReply({ content: p.content, components: p.components }).catch(() => {})
             : cmd.editReply(p.content).catch(() => {})
@@ -470,7 +494,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       case "read": {
         let placeholder: Message | undefined;
         try { placeholder = await message.reply("🔍 Working..."); } catch { placeholder = undefined; }
-        await handleRead(guildId, message.guild, textChannel, memberVC, null, args[0] ?? "",
+        await handleRead(guildId, message.guild, textChannel, memberVC, null, args[0] ?? "", message.author,
           async (p) => {
             try {
               if (placeholder) return await placeholder.edit({ content: p.content, components: p.components ?? [] });
