@@ -56,6 +56,12 @@ function buildProgressBar(pct: number, width = 20): string {
   return "▓".repeat(filled) + "░".repeat(width - filled);
 }
 
+function inviteUrl(): string {
+  const clientId = client.user?.id ?? "CLIENT_ID";
+  // permissions: Send Messages + Embed Links + Read Message History + Connect + Speak + Manage Messages
+  return `https://discord.com/oauth2/authorize?client_id=${clientId}&permissions=3237888&scope=bot+applications.commands`;
+}
+
 function helpText(): string {
   return [
     "📖 **WCT Reader Bot**",
@@ -71,6 +77,7 @@ function helpText(): string {
     "`/seek <seconds>` — jump to a timestamp (e.g. `/seek 120` = 2:00)",
     "`/progress` — show current progress info",
     "`/voice` — pick a TTS voice from a dropdown",
+    "`/invite` — get a link to add this bot to your server",
     "`/help` — show this message",
     "",
     "Progress embed buttons: ⏮️ Restart · ⏪ -10s · ⏸️ Pause · ⏩ +10s · ⏹️ Stop",
@@ -184,13 +191,18 @@ async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url
     if (!ch || !("send" in ch)) return;
     const ts = `<t:${Math.floor(Date.now() / 1000)}:F>`;
 
-    // Try to find an existing permanent invite, or create one, and use it as the server link
+    // Build a joinable server link: vanity URL first (no perms needed),
+    // then try creating a channel invite (needs Manage Channels), else plain name
     let serverLink = guild.name;
     try {
-      const existing  = await sourceChannel.fetchInvites();
-      const permanent = existing.find((inv) => inv.maxAge === 0 && !inv.expiresAt);
-      const inviteUrl = permanent?.url ?? (await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" })).url;
-      serverLink = `[${guild.name}](${inviteUrl})`;
+      if (guild.vanityURLCode) {
+        serverLink = `[${guild.name}](https://discord.gg/${guild.vanityURLCode})`;
+      } else {
+        const existing  = await sourceChannel.fetchInvites();
+        const permanent = existing.find((inv) => inv.maxAge === 0 && !inv.expiresAt);
+        const inv = permanent ?? await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" });
+        serverLink = `[${guild.name}](${inv.url})`;
+      }
     } catch { /* non-fatal — bot may lack Manage Channels permission */ }
 
     await (ch as TextChannel).send(
@@ -470,6 +482,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       }
       case "progress": await editReply(handleProgress(guildId));   break;
       case "help":     await editReply(helpText());                break;
+      case "invite":   await editReply(`🔗 **Add me to your server:**\n${inviteUrl()}`); break;
 
       case "voice":
         await sendVoicePicker(guildId,
@@ -538,6 +551,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
           break;
         }
         case "progress": reply = handleProgress(guildId); break;
+        case "invite":   reply = `🔗 **Add me to your server:**\n${inviteUrl()}`; break;
         default: reply = `❓ Unknown command. Try \`!help\`.`;
       }
     } catch (err) {
@@ -594,6 +608,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         break;
       }
       case "progress": reply = handleProgress(guildId);   break;
+      case "invite":   reply = `🔗 **Add me to your server:**\n${inviteUrl()}`; break;
       case "help":     reply = helpText();                break;
       default: return;
     }

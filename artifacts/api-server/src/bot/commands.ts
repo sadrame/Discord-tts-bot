@@ -64,4 +64,8 @@ export const slashCommands = [
   new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show all bot commands"),
+
+  new SlashCommandBuilder()
+    .setName("invite")
+    .setDescription("Get a link to add this bot to your server"),
 ].map((cmd) => cmd.toJSON());
