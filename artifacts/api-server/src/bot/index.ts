@@ -28,10 +28,12 @@ import {
   seekSessionBySeconds,
   seekRelativeSeconds,
   restartSession,
+  skipToChapter,
   forceProgressUpdate,
   getSession,
   getProgressInfo,
   getProgressSeconds,
+  getChapterInfo,
   getGuildVoice,
   setGuildVoice,
 } from "./voice.js";
@@ -61,13 +63,16 @@ function helpText(): string {
     "`/pause` — pause playback",
     "`/resume` — resume playback",
     "`/skip` — skip current paragraph",
+    "`/chapter <n>` — jump to chapter/section N",
+    "`/chapters` — list all detected chapters in the current reading",
     "`/restart` — restart the chapter from the beginning",
     "`/seek <seconds>` — jump to a timestamp (e.g. `/seek 120` = 2:00)",
-    "`/progress` — show a progress bar",
+    "`/progress` — show current progress info",
     "`/voice` — pick a TTS voice from a dropdown",
     "`/help` — show this message",
     "",
-    "The progress bar has ⏮️ ⏪-30s ⏸️ ⏩+30s ⏹️ buttons for live control.",
+    "Progress embed buttons: ⏮️ Restart · ⏪ -10s · ⏸️ Pause · ⏩ +10s · ⏹️ Stop",
+    "Chapter buttons: ⬅️ Prev Ch. · ➡️ Next Ch. (appear when chapters are detected)",
     "",
     "All commands also work with the `!` prefix.",
     "Supports WitchCultTranslations and AO3 links.",
@@ -219,8 +224,16 @@ async function handleRead(
     `🎙️ Voice: **${voice.label}** — ${voice.accent} ${voice.gender} | Joining **${voiceChannel.name}**`
   );
 
+  // Announce detected chapters/sections
+  if (chapter.sections.length > 1) {
+    await safeSend(
+      textChannel,
+      `📑 Detected **${chapter.sections.length} sections** — use \`/chapter <n>\` or the ⬅️ ➡️ buttons to navigate.`
+    );
+  }
+
   try {
-    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, resumeFromChunk);
+    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, chapter.sections, resumeFromChunk);
   } catch (err) {
     await safeSend(textChannel, `❌ Voice error: ${(err as Error).message}`);
   }
@@ -254,6 +267,22 @@ function handleProgress(guildId: string): string {
     `Chunk ${info.index}/${info.total}` +
     (info.paused ? " *(paused)*" : "")
   );
+}
+
+function handleChapter(guildId: string, num: number): string {
+  const result = skipToChapter(guildId, num);
+  if (!result.ok) return `❌ ${result.title || "No chapters detected in this content."}`;
+  return `📑 Jumping to chapter **${num}**: *${result.title}* (${result.total} total)...`;
+}
+
+function handleChapters(guildId: string): string {
+  const info = getChapterInfo(guildId);
+  if (!info) return "❌ Nothing is currently playing.";
+  if (info.total <= 1) return "ℹ️ No separate chapters/sections were detected in this content.";
+  const list = info.titles
+    .map((t, i) => `${i + 1 === info.current ? "▶️" : "　"} **${i + 1}.** ${t}`)
+    .join("\n");
+  return `📑 **Chapters** (currently on ${info.current}/${info.total}):\n${list}`;
 }
 
 function handleRestart(guildId: string): string {
@@ -314,20 +343,31 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   if (interaction.isButton()) {
     const btn = interaction as ButtonInteraction;
     const { customId } = btn;
-    if (["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop"].includes(customId)) {
+    const CTRL_IDS = ["ctrl_restart","ctrl_back","ctrl_forward","ctrl_pause","ctrl_stop","ctrl_prev_chapter","ctrl_next_chapter"];
+    if (CTRL_IDS.includes(customId)) {
       await btn.deferUpdate().catch(() => {});
       switch (customId) {
-        case "ctrl_restart": restartSession(guildId); break;
-        case "ctrl_back":    seekRelativeSeconds(guildId, -30); break;
-        case "ctrl_forward": seekRelativeSeconds(guildId, +30); break;
+        case "ctrl_restart":      restartSession(guildId); break;
+        case "ctrl_back":         seekRelativeSeconds(guildId, -10); break;
+        case "ctrl_forward":      seekRelativeSeconds(guildId, +10); break;
         case "ctrl_pause": {
           const s = getSession(guildId);
           if (s?.paused) resumeSession(guildId); else pauseSession(guildId);
           break;
         }
-        case "ctrl_stop": await stopSession(guildId); break;
+        case "ctrl_stop":         await stopSession(guildId); break;
+        case "ctrl_prev_chapter": {
+          const ci = getChapterInfo(guildId);
+          if (ci) skipToChapter(guildId, Math.max(1, ci.current - 1));
+          break;
+        }
+        case "ctrl_next_chapter": {
+          const ci = getChapterInfo(guildId);
+          if (ci) skipToChapter(guildId, Math.min(ci.total, ci.current + 1));
+          break;
+        }
       }
-      // Immediately refresh the progress bar so the button states update at once
+      // Immediately refresh embed so button states update at once
       await forceProgressUpdate(guildId).catch(() => {});
       return;
     }
@@ -378,6 +418,12 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
       case "pause":    await editReply(handlePause(guildId));      break;
       case "resume":   await editReply(handleResume(guildId));     break;
       case "skip":     await editReply(handleSkip(guildId));       break;
+      case "chapter": {
+        const num = cmd.options.getInteger("number", true);
+        await editReply(handleChapter(guildId, num));
+        break;
+      }
+      case "chapters": await editReply(handleChapters(guildId)); break;
       case "restart":  await editReply(handleRestart(guildId));    break;
       case "seek": {
         const secs = cmd.options.getInteger("seconds", true);
@@ -448,6 +494,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
       case "pause":    reply = handlePause(guildId);      break;
       case "resume":   reply = handleResume(guildId);     break;
       case "skip":     reply = handleSkip(guildId);       break;
+      case "chapter": {
+        const num = parseInt(args[0] ?? "", 10);
+        reply = isNaN(num) || num < 1 ? "❌ Usage: `!chapter <number>`" : handleChapter(guildId, num);
+        break;
+      }
+      case "chapters": reply = handleChapters(guildId); break;
       case "restart":  reply = handleRestart(guildId);    break;
       case "seek": {
         const secs = parseInt(args[0] ?? "", 10);

@@ -40,6 +40,17 @@ export const slashCommands = [
     .setDescription("Pick a TTS voice from a dropdown menu"),
 
   new SlashCommandBuilder()
+    .setName("chapter")
+    .setDescription("Jump to a specific detected chapter or section")
+    .addIntegerOption((o) =>
+      o.setName("number").setDescription("Chapter number to jump to (see /chapters for the list)").setRequired(true).setMinValue(1)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("chapters")
+    .setDescription("List all detected chapters/sections in the current reading"),
+
+  new SlashCommandBuilder()
     .setName("restart")
     .setDescription("Restart the current chapter from the beginning"),
 

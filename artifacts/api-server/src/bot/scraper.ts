@@ -1,11 +1,18 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 
+export interface ChapterSection {
+  title: string;
+  startParagraph: number; // index into paragraphs[]
+}
+
 export interface ScrapedChapter {
   title: string;
   content: string;
   url: string;
   paragraphs: string[];
+  /** Detected sections/chapters within the page (headings, scene breaks, hr). */
+  sections: ChapterSection[];
 }
 
 const SELECTORS_BY_HOST: Record<string, { content: string[]; title: string[] }> = {
@@ -17,7 +24,6 @@ const SELECTORS_BY_HOST: Record<string, { content: string[]; title: string[] }> 
     title: [".entry-title", "h1"],
     content: [".entry-content", ".post-content"],
   },
-  // Archive of Our Own — chapters live in .userstuff[role="article"]
   "archiveofourown.org": {
     title: ["h2.title.heading", "h3.title", "h2.title"],
     content: [".userstuff[role='article']", "#chapters .userstuff", ".userstuff"],
@@ -52,17 +58,58 @@ function cleanText(text: string): string {
     .trim();
 }
 
-function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<cheerio.AnyNode>): string[] {
-  const paragraphs: string[] = [];
+/** Check if a paragraph is a scene-divider (---, ***, ~~~, etc.) */
+function isSceneDivider(text: string): boolean {
+  return /^[-*~=✦◆·•]{3,}$/.test(text.replace(/\s/g, ""));
+}
 
-  contentEl.find("p, h2, h3, h4, h5, h6").each((_, el) => {
+interface ExtractResult {
+  paragraphs: string[];
+  sections: ChapterSection[];
+}
+
+function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<cheerio.AnyNode>): ExtractResult {
+  const paragraphs: string[] = [];
+  const sections: ChapterSection[] = [];
+  let partCounter = 0;
+
+  contentEl.find("p, h1, h2, h3, h4, h5, h6, hr").each((_, el) => {
     const tag = (el as cheerio.Element).tagName?.toLowerCase() ?? "";
     if (SKIP_TAGS.has(tag)) return;
 
-    const text = cleanText($(el).text());
-    if (text.length > 20) {
-      paragraphs.push(text);
+    // Horizontal rule = unnamed scene break
+    if (tag === "hr") {
+      if (paragraphs.length > 0) {
+        partCounter++;
+        sections.push({ title: `Part ${partCounter}`, startParagraph: paragraphs.length });
+      }
+      return;
     }
+
+    const text = cleanText($(el).text());
+    if (!text) return;
+
+    // Heading = named chapter/section boundary
+    if (/^h[1-6]$/.test(tag) && text.length < 200) {
+      // Mark boundary at the current paragraph position
+      sections.push({ title: text, startParagraph: paragraphs.length });
+      // Also include heading as a spoken paragraph so TTS announces it
+      if (text.length > 3) paragraphs.push(text);
+      return;
+    }
+
+    if (text.length <= 20) return;
+
+    // Scene divider pattern
+    if (isSceneDivider(text)) {
+      if (paragraphs.length > 0) {
+        partCounter++;
+        sections.push({ title: `Part ${partCounter}`, startParagraph: paragraphs.length });
+      }
+      return;
+    }
+
+    paragraphs.push(text);
   });
 
   // If no paragraphs found via <p> tags, fall back to full text split
@@ -72,23 +119,18 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
     paragraphs.push(...lines);
   }
 
-  return paragraphs;
+  return { paragraphs, sections };
 }
 
-/** Extra request config per host — cookies, headers, etc. */
 function extraConfig(hostname: string): { headers?: Record<string, string>; params?: Record<string, string> } {
   if (hostname === "archiveofourown.org") {
     return {
-      headers: {
-        // AO3 requires this cookie to view adult/mature content without a login redirect
-        Cookie: "view_adult=true",
-      },
+      headers: { Cookie: "view_adult=true" },
     };
   }
   return {};
 }
 
-/** Build a human-readable title for AO3 chapters (Work title + Chapter title). */
 function buildAo3Title($: cheerio.CheerioAPI): string {
   const workTitle    = cleanText($("h2.title.heading").first().text());
   const chapterTitle = cleanText($(".chapter .title").first().text().replace(/^Chapter\s+\d+[:.]?\s*/i, ""));
@@ -103,7 +145,6 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
 
   const { data: html } = await axios.get(url, {
     headers: {
-      // Realistic browser UA — some sites (AO3) block simple bot UAs
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -115,18 +156,15 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
 
   const $ = cheerio.load(html);
 
-  // Remove noise
   $(
     "script, style, nav, header, footer, aside, noscript, " +
     ".sharedaddy, .jp-relatedposts, .comments-area, #comments, " +
-    // AO3-specific noise
     "#header, #footer, #main > .wrapper > .message, " +
     ".kudos, .bookmarks, .hits, #kudos, .comment_count"
   ).remove();
 
   const siteSelectors = SELECTORS_BY_HOST[hostname];
 
-  // Find title
   let title = "";
   if (hostname === "archiveofourown.org") {
     title = buildAo3Title($);
@@ -142,16 +180,17 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
   }
   if (!title) title = $("title").text().split("|")[0]?.trim() ?? "Chapter";
 
-  // Find content
   let paragraphs: string[] = [];
+  let sections: ChapterSection[] = [];
   const contentSelectors = siteSelectors?.content ?? GENERIC_CONTENT_SELECTORS;
 
   for (const sel of contentSelectors) {
     const el = $(sel).first();
     if (el.length) {
       const found = extractParagraphs($, el);
-      if (found.length >= 3) {
-        paragraphs = found;
+      if (found.paragraphs.length >= 3) {
+        paragraphs = found.paragraphs;
+        sections   = found.sections;
         break;
       }
     }
@@ -169,5 +208,6 @@ export async function scrapeChapter(url: string): Promise<ScrapedChapter> {
     content: paragraphs.join("\n\n"),
     url,
     paragraphs,
+    sections,
   };
 }
