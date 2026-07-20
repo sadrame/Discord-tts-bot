@@ -98,7 +98,7 @@ function extractParagraphs($: cheerio.CheerioAPI, contentEl: cheerio.Cheerio<che
       return;
     }
 
-    if (text.length <= 20) return;
+    if (text.length < 2) return;
 
     // Scene divider pattern
     if (isSceneDivider(text)) {
