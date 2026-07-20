@@ -32,6 +32,7 @@ import {
   skipToChapter,
   forceProgressUpdate,
   getSession,
+  getSessionByUserId,
   getProgressInfo,
   getProgressSeconds,
   getChapterInfo,
@@ -175,17 +176,18 @@ async function pickVoiceChannel(
 
 // ─── Admin read log ───────────────────────────────────────────────────────────
 
-async function logRead(user: User, guild: Guild, url: string): Promise<void> {
+async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url: string): Promise<void> {
   const channelId = process.env["DISCORD_LOG_CHANNEL_ID"];
   if (!channelId) return;
   try {
     const ch = await client.channels.fetch(channelId);
     if (!ch || !("send" in ch)) return;
-    const ts = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+    const ts          = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+    const serverLink  = `[${guild.name}](https://discord.com/channels/${guild.id}/${sourceChannel.id})`;
     await (ch as TextChannel).send(
       `📋 **Read request**\n` +
       `👤 **User:** ${user.tag} (${user.id})\n` +
-      `🏠 **Server:** ${guild.name} (${guild.id})\n` +
+      `🏠 **Server:** ${serverLink}\n` +
       `🔗 **URL:** ${url}\n` +
       `🕐 **Time:** ${ts}`
     );
@@ -225,7 +227,7 @@ async function handleRead(
   catch (err) { await safeSend(textChannel, `❌ Could not read that page: ${(err as Error).message}`); return; }
 
   // Log the request to the admin channel (fire-and-forget)
-  logRead(requestedBy, guild, url).catch(() => {});
+  logRead(requestedBy, guild, textChannel, url).catch(() => {});
 
   // ── Check for saved bookmark ─────────────────────────────────────────────
   let resumeFromChunk = 0;
@@ -257,7 +259,7 @@ async function handleRead(
   }
 
   try {
-    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, chapter.sections, resumeFromChunk);
+    await startReading(guild, voiceChannel, textChannel, chapter.title, chapter.paragraphs, url, chapter.sections, resumeFromChunk, requestedBy.id);
   } catch (err) {
     await safeSend(textChannel, `❌ Voice error: ${(err as Error).message}`);
   }
@@ -339,7 +341,9 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.DirectMessages,
   ],
+  partials: ["CHANNEL" as any], // required to receive DM events
 });
 
 // ─── Ready ────────────────────────────────────────────────────────────────────
@@ -475,26 +479,75 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
 client.on(Events.MessageCreate, async (message: Message) => {
   if (message.author.bot) return;
-  if (!message.guild) return;
   if (!message.content.startsWith(PREFIX)) return;
 
   const args    = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const command = args.shift()?.toLowerCase();
   if (!command) return;
 
-  const guildId     = message.guild.id;
-  const member      = message.member as GuildMember | null;
-  const memberVC    = member?.voice?.channel ?? null;
+  const inDM        = !message.guild;
   const textChannel = message.channel as TextChannel;
-
   let reply = "";
+
+  // ── DM / group-chat handling ──────────────────────────────────────────────
+  if (inDM) {
+    if (command === "help") {
+      try { await message.reply(helpText()); } catch { /* ignore */ }
+      return;
+    }
+
+    if (command === "read") {
+      try { await message.reply("❌ Voice reading requires a server with voice channels. Use `/read` or `!read` in a server text channel, then you can control playback from here."); } catch { /* ignore */ }
+      return;
+    }
+
+    // Control commands — find the user's active session across all guilds
+    const session = getSessionByUserId(message.author.id);
+    if (!session) {
+      try { await message.reply("❌ You don't have an active reading session. Start one in a server first."); } catch { /* ignore */ }
+      return;
+    }
+    const guildId = session.guildId;
+
+    try {
+      switch (command) {
+        case "stop":     reply = await handleStop(guildId); break;
+        case "pause":    reply = handlePause(guildId);      break;
+        case "resume":   reply = handleResume(guildId);     break;
+        case "skip":     reply = handleSkip(guildId);       break;
+        case "restart":  reply = handleRestart(guildId);    break;
+        case "chapter": {
+          const num = parseInt(args[0] ?? "", 10);
+          reply = isNaN(num) || num < 1 ? "❌ Usage: `!chapter <number>`" : handleChapter(guildId, num);
+          break;
+        }
+        case "chapters": reply = handleChapters(guildId); break;
+        case "seek": {
+          const secs = parseInt(args[0] ?? "", 10);
+          reply = isNaN(secs) || secs < 0 ? "❌ Usage: `!seek <seconds>`" : handleSeek(guildId, secs);
+          break;
+        }
+        case "progress": reply = handleProgress(guildId); break;
+        default: reply = `❓ Unknown command. Try \`!help\`.`;
+      }
+    } catch (err) {
+      reply = `❌ Error: ${(err as Error).message}`;
+    }
+    try { await message.reply(reply); } catch { /* ignore */ }
+    return;
+  }
+
+  // ── Server (guild) handling ───────────────────────────────────────────────
+  const guildId  = message.guild!.id;
+  const member   = message.member as GuildMember | null;
+  const memberVC = member?.voice?.channel ?? null;
 
   try {
     switch (command) {
       case "read": {
         let placeholder: Message | undefined;
         try { placeholder = await message.reply("🔍 Working..."); } catch { placeholder = undefined; }
-        await handleRead(guildId, message.guild, textChannel, memberVC, null, args[0] ?? "", message.author,
+        await handleRead(guildId, message.guild!, textChannel, memberVC, null, args[0] ?? "", message.author,
           async (p) => {
             try {
               if (placeholder) return await placeholder.edit({ content: p.content, components: p.components ?? [] });

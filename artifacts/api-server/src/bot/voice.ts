@@ -31,6 +31,7 @@ import type { ChapterSection } from "./scraper.js";
 
 export interface ReadSession {
   guildId:          string;
+  userId:           string;         // who started the session (for DM control)
   title:            string;
   url:              string;
   allChunks:        string[];
@@ -65,6 +66,14 @@ interface ChunkResult {
 
 const sessions    = new Map<string, ReadSession>();
 const guildVoices = new Map<string, VoiceOption>();
+// Reverse lookup: userId → guildId, so DM commands can find the active session
+const userToGuild = new Map<string, string>();
+
+/** Find a session by the user who started it (used for DM control commands). */
+export function getSessionByUserId(userId: string): ReadSession | undefined {
+  const guildId = userToGuild.get(userId);
+  return guildId ? sessions.get(guildId) : undefined;
+}
 
 // ─── Voice preference ─────────────────────────────────────────────────────────
 
@@ -100,6 +109,7 @@ export async function stopSession(guildId: string): Promise<void> {
     }
     session.stopped = true;
     session.player.stop(true);
+    userToGuild.delete(session.userId);
     if (session.chunkIndex > 0 && session.chunkIndex < session.allChunks.length) {
       await saveBookmark(
         guildId,
@@ -123,6 +133,7 @@ export async function startReading(
   url:             string,
   sections:        ChapterSection[] = [],
   resumeFromChunk  = 0,
+  userId           = "",
 ): Promise<void> {
   await stopSession(guild.id);
 
@@ -162,6 +173,7 @@ export async function startReading(
 
   const session: ReadSession = {
     guildId:          guild.id,
+    userId,
     title,
     url,
     allChunks,
@@ -183,6 +195,7 @@ export async function startReading(
   };
 
   sessions.set(guild.id, session);
+  if (userId) userToGuild.set(userId, guild.id);
 
   // Send initial "loading" embed
   try {
