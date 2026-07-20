@@ -58,8 +58,9 @@ function buildProgressBar(pct: number, width = 20): string {
 
 function inviteUrl(): string {
   const clientId = client.user?.id ?? "CLIENT_ID";
-  // permissions: Send Messages + Embed Links + Read Message History + Connect + Speak + Manage Messages
-  return `https://discord.com/oauth2/authorize?client_id=${clientId}&permissions=3237888&scope=bot+applications.commands`;
+  // permissions: Create Instant Invite + Send Messages + Manage Messages + Embed Links +
+  //              Read Message History + Connect + Speak
+  return `https://discord.com/oauth2/authorize?client_id=${clientId}&permissions=3237889&scope=bot+applications.commands`;
 }
 
 function helpText(): string {
@@ -192,18 +193,16 @@ async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url
     const ts = `<t:${Math.floor(Date.now() / 1000)}:F>`;
 
     // Build a joinable server link: vanity URL first (no perms needed),
-    // then try creating a channel invite (needs Manage Channels), else plain name
+    // then createInvite with unique:false so Discord deduplicates (needs Create Instant Invite only)
     let serverLink = guild.name;
     try {
       if (guild.vanityURLCode) {
         serverLink = `[${guild.name}](https://discord.gg/${guild.vanityURLCode})`;
       } else {
-        const existing  = await sourceChannel.fetchInvites();
-        const permanent = existing.find((inv) => inv.maxAge === 0 && !inv.expiresAt);
-        const inv = permanent ?? await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" });
+        const inv = await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" });
         serverLink = `[${guild.name}](${inv.url})`;
       }
-    } catch { /* non-fatal — bot may lack Manage Channels permission */ }
+    } catch { /* non-fatal — bot may lack Create Instant Invite permission in this channel */ }
 
     await (ch as TextChannel).send(
       `📋 **Read request**\n` +
