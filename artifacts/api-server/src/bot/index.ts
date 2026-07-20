@@ -176,28 +176,28 @@ async function pickVoiceChannel(
 
 // ─── Admin read log ───────────────────────────────────────────────────────────
 
-async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url: string): Promise<void> {
+async function logRead(user: User, guild: Guild, sourceChannel: TextChannel, url: string, voiceLabel: string): Promise<void> {
   const channelId = process.env["DISCORD_LOG_CHANNEL_ID"];
   if (!channelId) return;
   try {
     const ch = await client.channels.fetch(channelId);
     if (!ch || !("send" in ch)) return;
-    const ts         = `<t:${Math.floor(Date.now() / 1000)}:F>`;
-    const serverLink = `[${guild.name}](https://discord.com/channels/${guild.id}/${sourceChannel.id})`;
+    const ts = `<t:${Math.floor(Date.now() / 1000)}:F>`;
 
-    // Try to find an existing permanent invite, or create one
-    let inviteLine = "";
+    // Try to find an existing permanent invite, or create one, and use it as the server link
+    let serverLink = guild.name;
     try {
-      const existing = await sourceChannel.fetchInvites();
+      const existing  = await sourceChannel.fetchInvites();
       const permanent = existing.find((inv) => inv.maxAge === 0 && !inv.expiresAt);
       const inviteUrl = permanent?.url ?? (await sourceChannel.createInvite({ maxAge: 0, maxUses: 0, unique: false, reason: "Bot log invite" })).url;
-      inviteLine = `\n📨 **Invite:** ${inviteUrl}`;
+      serverLink = `[${guild.name}](${inviteUrl})`;
     } catch { /* non-fatal — bot may lack Manage Channels permission */ }
 
     await (ch as TextChannel).send(
       `📋 **Read request**\n` +
       `👤 **User:** ${user.tag} (${user.id})\n` +
-      `🏠 **Server:** ${serverLink}${inviteLine}\n` +
+      `🏠 **Server:** ${serverLink}\n` +
+      `🎙️ **Voice:** ${voiceLabel}\n` +
       `🔗 **URL:** ${url}\n` +
       `🕐 **Time:** ${ts}`
     );
@@ -237,7 +237,7 @@ async function handleRead(
   catch (err) { await safeSend(textChannel, `❌ Could not read that page: ${(err as Error).message}`); return; }
 
   // Log the request to the admin channel (fire-and-forget)
-  logRead(requestedBy, guild, textChannel, url).catch(() => {});
+  logRead(requestedBy, guild, textChannel, url, getGuildVoice(guildId).label).catch(() => {});
 
   // ── Check for saved bookmark ─────────────────────────────────────────────
   let resumeFromChunk = 0;
